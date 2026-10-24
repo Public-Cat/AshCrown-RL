@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "obs_schema": "ashcrown-obs-v1",
+  "action_schema": "ashcrown-act-v1",
+  "game_repo": "git@github.com:Public-Cat/AshCrown.git",
+  "game_min_commit": null,
+  "notes": "Set game_min_commit when the RL bridge (RL-2/RL-3) lands. The client must still verify the live handshake and layout_hash; this file is documentation, not a substitute for the handshake."
+}

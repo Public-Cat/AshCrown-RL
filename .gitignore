@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Training outputs — never commit models or run logs
+runs/
+checkpoints/
+wandb/
+*.pt
+*.pth
+*.onnx
+*.zip
+*.npz
+*.jsonl
+artifacts/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

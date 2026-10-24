@@ -1,0 +1,42 @@
+[project]
+name = "ashcrown-rl"
+version = "0.0.0"
+description = "Reinforcement-learning clients and training pipeline for AshCrown"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Proprietary" }
+dependencies = [
+    "numpy>=2.0,<3",
+    "gymnasium>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "ruff>=0.8",
+]
+train = [
+    "stable-baselines3>=2.4,<3",
+    "torch>=2.5",
+]
+
+[tool.uv]
+# The package is imported from the repository root while the client is being
+# built (RL-3/RL-4); no wheel build is needed yet.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+markers = [
+    "integration: launches a Godot process (needs the game checkout + godot)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
