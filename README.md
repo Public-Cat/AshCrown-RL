@@ -39,7 +39,7 @@ cd AshCrown/training
 uv python install 3.12
 uv sync --extra dev            # numpy + gymnasium + test/lint tools
 # optional, for PPO:
-uv sync --extra train          # stable-baselines3 + torch
+uv sync --extra dev --extra train   # + stable-baselines3 + torch
 
 uv run pytest
 uv run ruff check .
