@@ -6,6 +6,10 @@ skips cleanly when the game checkout or the godot binary is missing.
 
 from __future__ import annotations
 
+import gc
+import subprocess
+import time
+import weakref
 from typing import Any
 
 import gymnasium as gym
@@ -94,3 +98,88 @@ def test_close_stops_every_child_process(vec_env: AshCrownVectorEnv) -> None:
     vec_env.close()
     vec_env.close()  # idempotent
     assert all(not process.is_alive() for process in processes)
+
+
+# --------------------------------------------------------------------------- #
+# Process-leak regressions (review findings on #94)
+# --------------------------------------------------------------------------- #
+def _engine_pids() -> set[int]:
+    """PIDs of live ``rl_env.tscn`` engine processes on this host."""
+    result = subprocess.run(
+        ["pgrep", "-f", "scenes/rl/rl_env.tscn"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {int(line) for line in result.stdout.split() if line.strip()}
+
+
+def _wait_for(predicate: Any, timeout: float = 30.0) -> bool:
+    """Poll ``predicate`` until true (or ``timeout`` elapses); return the result."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return bool(predicate())
+
+
+@pytest.mark.integration
+def test_close_accepts_the_gymnasium_terminate_flag(env_kwargs: dict[str, Any]) -> None:
+    """``AsyncVectorEnv.__del__`` calls ``close(terminate=True)`` (docs §9.3)."""
+    vec = make_vec_env(2, seed=20260106, env_kwargs={**env_kwargs, "max_ticks": 120})
+    vec.reset()
+    processes = list(vec.processes)
+    assert len(processes) == 2
+    vec.close(terminate=True)
+    assert _wait_for(lambda: not any(process.is_alive() for process in processes))
+    vec.close(terminate=True)  # idempotent
+
+
+@pytest.mark.integration
+def test_garbage_collection_closes_the_workers(env_kwargs: dict[str, Any]) -> None:
+    """A dropped vector env must not leave live workers (nor engines) behind."""
+    baseline = _engine_pids()
+    vec = make_vec_env(2, seed=20260107, env_kwargs={**env_kwargs, "max_ticks": 120})
+    vec.reset()
+    processes = list(vec.processes)
+    ref = weakref.ref(vec)
+    del vec
+    gc.collect()
+    assert ref() is None, "the vector env is still referenced"
+    assert _wait_for(lambda: not any(process.is_alive() for process in processes))
+    assert _wait_for(lambda: not (_engine_pids() - baseline))
+
+
+@pytest.mark.integration
+def test_a_failed_construction_leaks_no_worker(
+    env_kwargs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising ``__init__`` reaps the workers it already started."""
+    baseline = _engine_pids()
+
+    def _boom(self: Any) -> None:
+        raise RuntimeError("space check failed")
+
+    monkeypatch.setattr(AshCrownVectorEnv, "_check_spaces", _boom)
+    with pytest.raises(RuntimeError, match="space check failed"):
+        make_vec_env(1, seed=20260108, env_kwargs={**env_kwargs, "max_ticks": 120})
+    assert _wait_for(lambda: not (_engine_pids() - baseline)), "a worker engine survived"
+
+
+@pytest.mark.integration
+def test_a_failed_construction_closes_the_parent_probe_env(
+    env_kwargs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe env Gymnasium builds from ``env_fns[0]`` is closed on failure."""
+    import gymnasium.vector.async_vector_env as async_vector_env
+
+    baseline = _engine_pids()
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("batch_space failed")
+
+    monkeypatch.setattr(async_vector_env, "batch_space", _boom)
+    with pytest.raises(RuntimeError, match="batch_space failed"):
+        make_vec_env(2, seed=20260109, env_kwargs={**env_kwargs, "max_ticks": 120})
+    assert _wait_for(lambda: not (_engine_pids() - baseline)), "the probe env survived"

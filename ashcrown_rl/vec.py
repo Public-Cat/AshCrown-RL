@@ -13,8 +13,14 @@ and ``shared_memory=False``:
 * ``autoreset_mode=SAME_STEP`` gives Gymnasium's standard autoreset: the
   terminal step returns the reset observation plus the real
   ``info["final_obs"]``/``info["final_info"]``;
-* :meth:`AshCrownVectorEnv.close` also kills any worker process that outlives
-  the graceful close, so no Godot process is left behind.
+* :meth:`AshCrownVectorEnv.close` forwards Gymnasium's ``terminate`` flag and
+  then kills any worker process that outlives the close, so neither a
+  ``close(terminate=True)`` nor the ``__del__`` path (which passes
+  ``terminate=True``) leaves a Godot process behind;
+* a constructor that raises (a worker env that refuses its config, a space
+  mismatch, …) reaps the workers it already started, and :func:`make_vec_env`
+  closes the parent-side probe environment Gymnasium builds from
+  ``env_fns[0]`` — a failed ``make_vec_env`` leaks nothing.
 """
 
 from __future__ import annotations
@@ -67,15 +73,48 @@ class SeededAshCrownEnv(gym.Wrapper):
 class AshCrownVectorEnv(AsyncVectorEnv):
     """``AsyncVectorEnv`` that also reaps its workers (and their Godot processes)."""
 
-    def close(self) -> None:
-        """Graceful close, then hard-terminate any surviving worker process."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Build the vector env, reaping every started worker if it fails.
+
+        ``AsyncVectorEnv.__init__`` starts the worker processes before it
+        validates their spaces, so a raising constructor would otherwise leave
+        live workers (and an open pipe per worker) behind.
+        """
         try:
-            super().close()
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self._discard_partial_init()
+            raise
+
+    def close(self, terminate: bool = False) -> None:
+        """Close every worker, then hard-terminate any that survived.
+
+        ``terminate`` is Gymnasium's flag (``AsyncVectorEnv.__del__`` calls
+        ``close(terminate=True)``), so it must be accepted — otherwise a
+        garbage-collected vector env raises ``TypeError`` instead of closing
+        and leaks one Godot process per worker.
+        """
+        try:
+            super().close(terminate=terminate)
         finally:
             self._reap_workers()
 
+    def _discard_partial_init(self) -> None:
+        """Reap what a failed ``__init__`` already started (workers + pipes)."""
+        self._reap_workers()
+        for pipe in getattr(self, "parent_pipes", None) or []:
+            if pipe is None:
+                continue
+            try:
+                pipe.close()
+            except (OSError, ValueError):  # pragma: no cover - already closed
+                continue
+        # Marks the instance closed so the inherited ``__del__`` does not try a
+        # second close on a half-built object.
+        self.closed = True
+
     def _reap_workers(self) -> None:
-        for process in getattr(self, "processes", []) or []:
+        for process in getattr(self, "processes", None) or []:
             try:
                 if process.is_alive():
                     process.terminate()
@@ -112,14 +151,25 @@ def make_vec_env(
         _make_worker_env(dict(kwargs), np.random.SeedSequence(worker_seed))
         for worker_seed in worker_seeds(master, int(n_envs))
     ]
-    return AshCrownVectorEnv(
-        env_fns,
-        shared_memory=False,
-        copy=True,
-        context=context,
-        daemon=daemon,
-        autoreset_mode=AutoresetMode.SAME_STEP,
-    )
+    # ``AsyncVectorEnv.__init__`` builds one env in *this* process from
+    # ``env_fns[0]`` to read the spaces. Track it so a failing constructor can
+    # close it: Gymnasium only closes it on its own success path.
+    probe = ProbeSink()
+    env_fns[0] = _track_probe_env(env_fns[0], probe)
+    try:
+        vec = AshCrownVectorEnv(
+            env_fns,
+            shared_memory=False,
+            copy=True,
+            context=context,
+            daemon=daemon,
+            autoreset_mode=AutoresetMode.SAME_STEP,
+        )
+    except BaseException:
+        close_envs(probe.envs)
+        raise
+    probe.envs.clear()  # the probe env is closed by the constructor
+    return vec
 
 
 def _make_worker_env(kwargs: dict[str, Any], seed_sequence: np.random.SeedSequence) -> Any:
@@ -129,6 +179,47 @@ def _make_worker_env(kwargs: dict[str, Any], seed_sequence: np.random.SeedSequen
         return SeededAshCrownEnv(AshCrownEnv(**kwargs), seed_sequence)
 
     return _factory
+
+
+class ProbeSink:
+    """Collects the parent-side probe env Gymnasium builds from ``env_fns[0]``.
+
+    ``AsyncVectorEnv.__init__`` constructs one env in the *calling* process to
+    read its spaces and only closes it on its own success path, so a raising
+    constructor would leak that env (and its Godot process). The sink makes it
+    reachable from :func:`make_vec_env`.
+
+    It pickles as an **empty** sink: the env fns are shipped to the workers with
+    ``cloudpickle``, and a worker must not inherit a reference to the parent's
+    env (which holds a live subprocess and is not picklable).
+    """
+
+    def __init__(self) -> None:
+        self.envs: list[Any] = []
+
+    def __reduce__(self) -> tuple[type[ProbeSink], tuple[()]]:  # type: ignore[valid-type]
+        return (ProbeSink, ())
+
+
+def _track_probe_env(env_fn: Any, sink: ProbeSink) -> Any:
+    """Wrap ``env_fn`` so the env it builds in this process lands in ``sink``."""
+
+    def _factory() -> Any:
+        env = env_fn()
+        sink.envs.append(env)
+        return env
+
+    return _factory
+
+
+def close_envs(envs: list[Any]) -> None:
+    """Close every env in ``envs``, swallowing teardown errors (best effort)."""
+    for env in envs:
+        try:
+            env.close()
+        except Exception:  # teardown must never mask the constructor's cause
+            continue
+    envs.clear()
 
 
 def worker_seeds(seed: int, n_envs: int) -> list[int]:
@@ -146,8 +237,10 @@ def worker_seeds(seed: int, n_envs: int) -> list[int]:
 __all__ = [
     "DEFAULT_CONTEXT",
     "AshCrownVectorEnv",
+    "ProbeSink",
     "SeededAshCrownEnv",
     "_make_worker_env",
+    "close_envs",
     "make_vec_env",
     "worker_seeds",
 ]
