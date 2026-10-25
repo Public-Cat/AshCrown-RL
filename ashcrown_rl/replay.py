@@ -3,7 +3,7 @@
 A replay log is a small JSON document::
 
     {"version": 1,
-     "pins": {"protocol": 1, "obs_schema": "ashcrown-obs-v1", ...},
+     "pins": {"protocol": 1, "obs_schema": "ashcrown-obs-v2", ...},
      "config": {"level": 1, "character": "warrior", "frame_skip": 4,
                 "max_ticks": 18000, "reward_profile": "combat",
                 "reward_overrides": {}},
@@ -230,6 +230,7 @@ def record(
             "reward_overrides": dict(env.reward_overrides),
             "merchant_policy": env.merchant_policy,
             "hash_every_ticks": env.hash_every_ticks,
+            **env.observation_config(),
         },
         "seed": int(seed),
         "policy": policy_name,
@@ -268,10 +269,21 @@ def replay(env: AshCrownEnv | None, log: Mapping[str, Any]) -> dict[str, Any]:
         reward_overrides=config.get("reward_overrides") or {},
         merchant_policy=config.get("merchant_policy"),
         hash_every_ticks=int(config.get("hash_every_ticks", 60)),
+        obs_grid=bool(config.get("obs_grid", True)),
+        obs_grid_radius=int(config.get("obs_grid_radius", 10)),
+        perception_px=float(config.get("perception_px", 900.0)),
+        expose_portal=bool(config.get("expose_portal", True)),
+        obs_blocked=bool(config.get("obs_blocked", False)),
     )
     try:
         if pins.get("layout_hash") and pins["layout_hash"] != target.layout_hash:
             raise ValueError(f"log layout_hash {pins['layout_hash']} != live {target.layout_hash}")
+        logged_schema = pins.get("obs_schema")
+        if logged_schema and logged_schema != target.layout.obs_schema:
+            raise ValueError(
+                f"log obs_schema {logged_schema!r} != live {target.layout.obs_schema!r}: "
+                "re-record the episode (ashcrown-obs-v2 migration, docs/07 §8.5)"
+            )
         obs, info = target.reset(seed=int(log.get("seed", 0)))
         previous_state = state_line(info)
         for step, (action, expected) in enumerate(zip(actions, hashes, strict=True)):

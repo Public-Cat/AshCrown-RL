@@ -1,10 +1,19 @@
 {
   "protocol": 1,
-  "obs_schema": "ashcrown-obs-v1",
+  "obs_schema": "ashcrown-obs-v2",
   "action_schema": "ashcrown-act-v1",
-  "layout_hash": "fc8c0f26ccca4d8eef3ccbc8faa19cb2f78e27b5159913ef252648dc414ece1a",
+  "layout_hash": "fbcc9cdae85af53a8b0ee38ad6b81137168bb7fc2639dc1966cca75d01560d15",
   "obs_clamp": [-1.0, 1.0],
+  "observation_config": {
+    "obs_grid": true,
+    "obs_grid_radius": 10,
+    "perception_px": 900.0,
+    "expose_portal": true,
+    "obs_blocked": false
+  },
+  "grid_radius": {"min": 4, "max": 21, "default": 10},
+  "perception_px": {"min": 100.0, "max": 5000.0, "default": 900.0, "strict": 300.0},
   "game_repo": "git@github.com:Public-Cat/AshCrown.git",
-  "game_min_commit": "7d0ad23",
-  "notes": "game_min_commit is the game commit that landed the RL-3 bridge (TCP transport, protocol server mode, tools/rl). layout_hash pins the ashcrown-obs-v1 layout table (RLSchema.layout()); verify_handshake compares the live handshake against it unless an explicit expected_layout_hash override is passed. obs_clamp is the documented observation range. This file documents the target; the live handshake remains the compatibility authority."
+  "game_min_commit": "7b74d26",
+  "notes": "game_min_commit is the game commit that landed RL-6 (ashcrown-obs-v2, configurable observation). layout_hash pins the DEFAULT ashcrown-obs-v2 layout table (grid on, radius 10, perception 900, portal assist on, blocked off); any other observation config resolves to its own published layout_hash (RLSchema.layout_hash(config)) and verify_handshake compares the live handshake against this file unless an explicit expected_layout_hash override is passed. observation_config is the default config every reset must match for its lifetime; grid_radius/perception_px are the accepted option windows. obs_clamp is the documented observation range. This file documents the target; the live handshake remains the compatibility authority."
 }

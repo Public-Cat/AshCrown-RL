@@ -17,6 +17,9 @@ physics ticks per :meth:`step`, blocking while it waits for the next action.
 
 Contract (``docs/07`` §9.2):
 
+* the observation config (``obs_grid``, radius, ``perception_px``,
+  ``expose_portal``, ``obs_blocked``) is passed to the process before it
+  handshakes, so the published layout and the Gym space always agree;
 * ``observation_space`` is ``Box(-1, 1, (obs_len,), float32)`` and
   ``action_space`` is ``MultiDiscrete([9, 2, 2])`` — both built from the live
   handshake, never hardcoded;
@@ -47,7 +50,20 @@ from .launch import (
     LaunchConfig,
     default_game_project,
 )
-from .protocol import DEFAULT_TIMEOUT, GodotError, ProtocolError
+from .protocol import (
+    DEFAULT_EXPOSE_PORTAL,
+    DEFAULT_OBS_BLOCKED,
+    DEFAULT_OBS_GRID,
+    DEFAULT_OBS_GRID_RADIUS,
+    DEFAULT_PERCEPTION_PX,
+    DEFAULT_TIMEOUT,
+    GRID_RADIUS_MAX,
+    GRID_RADIUS_MIN,
+    PERCEPTION_PX_MAX,
+    PERCEPTION_PX_MIN,
+    GodotError,
+    ProtocolError,
+)
 from .spaces import Layout, LayoutError
 
 #: Default episode cap in physics ticks: 5 game-minutes for one level
@@ -80,8 +96,11 @@ class AshCrownEnv(gym.Env):
         level: int = 1,
         character: str = "warrior",
         frame_skip: int = 4,
-        obs_grid: bool = True,
-        obs_grid_radius: int = 10,
+        obs_grid: bool = DEFAULT_OBS_GRID,
+        obs_grid_radius: int = DEFAULT_OBS_GRID_RADIUS,
+        perception_px: float = DEFAULT_PERCEPTION_PX,
+        expose_portal: bool = DEFAULT_EXPOSE_PORTAL,
+        obs_blocked: bool = DEFAULT_OBS_BLOCKED,
         reward_profile: str = "combat",
         reward_overrides: Mapping[str, float] | None = None,
         max_ticks: int | None = None,
@@ -108,8 +127,16 @@ class AshCrownEnv(gym.Env):
             raise ValueError(f"mode={mode!r} is not implemented: choose one of {MODES}")
         if not 1 <= int(frame_skip) <= 64:
             raise ValueError(f"frame_skip={frame_skip!r} must be inside 1..64")
-        if not obs_grid:
-            raise ValueError("obs_grid=false is not implemented; the local grid stays on")
+        if not GRID_RADIUS_MIN <= int(obs_grid_radius) <= GRID_RADIUS_MAX:
+            raise ValueError(
+                f"obs_grid_radius={obs_grid_radius!r} must be inside "
+                f"{GRID_RADIUS_MIN}..{GRID_RADIUS_MAX} (docs/07 §5.1)"
+            )
+        if not PERCEPTION_PX_MIN <= float(perception_px) <= PERCEPTION_PX_MAX:
+            raise ValueError(
+                f"perception_px={perception_px!r} must be inside "
+                f"{PERCEPTION_PX_MIN:.0f}..{PERCEPTION_PX_MAX:.0f} (docs/07 §5.1)"
+            )
         if int(hash_every_ticks) < 1:
             raise ValueError(f"hash_every_ticks={hash_every_ticks!r} must be >= 1")
         if not 1 <= int(level) <= 10:
@@ -128,6 +155,9 @@ class AshCrownEnv(gym.Env):
         self.frame_skip = int(frame_skip)
         self.obs_grid = bool(obs_grid)
         self.obs_grid_radius = int(obs_grid_radius)
+        self.perception_px = float(perception_px)
+        self.expose_portal = bool(expose_portal)
+        self.obs_blocked = bool(obs_blocked)
         self.reward_profile = str(reward_profile)
         self.reward_overrides = dict(reward_overrides or {})
         # The cap default follows the mode (``docs/07`` §4.2): 5 game-minutes for
@@ -182,7 +212,9 @@ class AshCrownEnv(gym.Env):
                 "obs_len": self.obs_len,
                 "rel_cell_scale": self._layout.rel_cell_scale,
                 "blocks": self._layout_slices,
+                "observation_config": dict(self._layout.observation_config),
                 "grid": {
+                    "enabled": self._layout.grid_enabled,
                     "radius": self._layout.grid_radius,
                     "size": self._layout.grid_size,
                     "channels": list(self._layout.grid_channels),
@@ -207,7 +239,8 @@ class AshCrownEnv(gym.Env):
             godot_bin=self.godot_bin,
             exported_binary=None if self.exported_binary is None else self.exported_binary,
             timeout_sec=self.timeout,
-            extra_args=self.extra_args,
+            extra_args=tuple(self.extra_args) + self._obs_args(),
+            obs_config=self.observation_config(),
         )
         if self.startup_timeout is not None:
             config.startup_timeout_sec = float(self.startup_timeout)
@@ -249,11 +282,20 @@ class AshCrownEnv(gym.Env):
                 f"merchant_policy={self.merchant_policy!r} is not in the engine's "
                 f"policies {policies}"
             )
-        radius = self._layout.grid_radius
-        if radius and self.obs_grid_radius != radius:
-            raise ValueError(
-                f"obs_grid_radius={self.obs_grid_radius} but this build fixes it at {radius}"
-            )
+        # The engine pre-configures the observation from the launch arguments, so
+        # the handshake layout must match the config the caller asked for; a
+        # mismatch means the process advertised a different vector.
+        published = self._layout.observation_config
+        if published:
+            expected = self.observation_config()
+            for key, value in expected.items():
+                if key == "obs_grid_radius" and not self.obs_grid:
+                    continue
+                if published.get(key) != value:
+                    raise ValueError(
+                        f"the engine published observation_config[{key!r}]="
+                        f"{published.get(key)!r} but this env asked for {value!r}"
+                    )
         # ``obs_len`` is published twice: at the top level of the handshake and
         # inside the ``layout`` table. A disagreement means the client would
         # slice observations against a different table than the engine emits.
@@ -316,6 +358,9 @@ class AshCrownEnv(gym.Env):
             max_ticks=max_ticks,
             obs_grid=self.obs_grid,
             obs_grid_radius=self.obs_grid_radius,
+            perception_px=self.perception_px,
+            expose_portal=self.expose_portal,
+            obs_blocked=self.obs_blocked,
             reward_profile=reward_profile,
             reward_overrides=dict(reward_overrides or {}),
             hash_every_ticks=self.hash_every_ticks,
@@ -477,9 +522,31 @@ class AshCrownEnv(gym.Env):
         enriched["layout_slices"] = {
             name: list(bounds) for name, bounds in self._layout_slices.items()
         }
+        enriched["observation_config"] = self.observation_config()
         enriched["frame_skip"] = self.frame_skip
         enriched["mode"] = self.mode
         return enriched
+
+    # -- observation config -------------------------------------------------- #
+    def observation_config(self) -> dict[str, Any]:
+        """The observation config this env requested (and the handshake pins)."""
+        return {
+            "obs_grid": bool(self.obs_grid),
+            "obs_grid_radius": int(self.obs_grid_radius),
+            "perception_px": float(self.perception_px),
+            "expose_portal": bool(self.expose_portal),
+            "obs_blocked": bool(self.obs_blocked),
+        }
+
+    def _obs_args(self) -> tuple[str, ...]:
+        """Engine CLI flags that pre-configure the handshake layout (RL-6)."""
+        return (
+            f"--rl-obs-grid={'true' if self.obs_grid else 'false'}",
+            f"--rl-obs-grid-radius={int(self.obs_grid_radius)}",
+            f"--rl-perception-px={float(self.perception_px)}",
+            f"--rl-expose-portal={'true' if self.expose_portal else 'false'}",
+            f"--rl-obs-blocked={'true' if self.obs_blocked else 'false'}",
+        )
 
     # -- convenience -------------------------------------------------------- #
     def is_level_cleared(self, obs: np.ndarray) -> bool:

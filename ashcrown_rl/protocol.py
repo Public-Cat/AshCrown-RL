@@ -39,7 +39,7 @@ import numpy as np
 
 #: Protocol generation the client speaks (``docs/07`` §8.5).
 PROTOCOL = 1
-OBS_SCHEMA = "ashcrown-obs-v1"
+OBS_SCHEMA = "ashcrown-obs-v2"
 ACTION_SCHEMA = "ashcrown-act-v1"
 
 MSG_REQUEST = 0x01
@@ -58,7 +58,20 @@ MIN_TOTAL_LEN = 1 + 4 + 4
 #: Reset defaults (``docs/07`` Appendix C) used when the caller omits a field.
 DEFAULT_FRAME_SKIP = 4
 DEFAULT_MAX_TICKS = 18_000
+DEFAULT_OBS_GRID = True
 DEFAULT_OBS_GRID_RADIUS = 10
+#: Accepted radius window of the local grid (``docs/07`` §5.1).
+GRID_RADIUS_MIN = 4
+GRID_RADIUS_MAX = 21
+#: Enemy-slot perception radius in pixels (default = the game's cull boundary).
+DEFAULT_PERCEPTION_PX = 900.0
+#: The strict, human-visible preset (``--rl-perception-px=300``).
+STRICT_PERCEPTION_PX = 300.0
+PERCEPTION_PX_MIN = 100.0
+PERCEPTION_PX_MAX = 5000.0
+#: Portal bearing assist (``docs/07`` §5.7) and the optional blocked channel.
+DEFAULT_EXPOSE_PORTAL = True
+DEFAULT_OBS_BLOCKED = False
 DEFAULT_HASH_EVERY_TICKS = 60
 DEFAULT_CHARACTER = "warrior"
 DEFAULT_MODE = "level"
@@ -265,6 +278,7 @@ def verify_handshake(
     hello: Mapping[str, Any],
     compat: Mapping[str, Any] | None = None,
     expected_layout_hash: str | None = None,
+    expected_obs_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Verify the engine handshake against the compatibility contract.
 
@@ -273,7 +287,11 @@ def verify_handshake(
     ``compat.json``; pass ``{}`` to skip the version checks (evaluation only).
 
     ``layout_hash`` is pinned by ``compat.json`` unless ``expected_layout_hash``
-    overrides it explicitly (e.g. to evaluate an intentionally older build).
+    overrides it explicitly (e.g. to evaluate an intentionally older build) —
+    or unless the handshake's ``observation_config`` is not the default one the
+    compat file pins (RL-6: every observation config has its own layout hash).
+    ``expected_obs_config`` is what the caller asked the engine to publish; the
+    live ``observation_config`` must equal it exactly.
     The layout block table is cross-checked against ``obs_len`` and the
     published observation clamp must be ``[-1, 1]``.
     """
@@ -301,10 +319,33 @@ def verify_handshake(
     layout_hash = hello.get("layout_hash")
     if not isinstance(layout_hash, str) or len(layout_hash) != 64:
         raise ProtocolMismatch(f"handshake layout_hash={layout_hash!r} is not a SHA-256 hex")
+    if expected_obs_config is not None:
+        actual_config = hello.get("observation_config")
+        if not isinstance(actual_config, Mapping):
+            actual_config = (hello.get("layout") or {}).get("observation_config")
+        wanted = {key: expected_obs_config[key] for key in OBS_CONFIG_KEYS}
+        if not isinstance(actual_config, Mapping):
+            raise ProtocolMismatch("handshake carries no observation_config")
+        published = {key: actual_config.get(key) for key in OBS_CONFIG_KEYS}
+        for key, value in wanted.items():
+            if published[key] != value:
+                raise ProtocolMismatch(
+                    f"handshake observation_config[{key!r}]={published[key]!r} "
+                    f"but {value!r} was requested"
+                )
     pinned_hash = expected_layout_hash
     if pinned_hash is None:
         contract_hash = contract.get("layout_hash")
-        pinned_hash = contract_hash if isinstance(contract_hash, str) else None
+        contract_config = contract.get("observation_config")
+        actual_config = hello.get("observation_config")
+        if not isinstance(actual_config, Mapping):
+            actual_config = (hello.get("layout") or {}).get("observation_config")
+        default_config = (
+            contract_config is None
+            or actual_config is None
+            or dict(actual_config) == dict(contract_config)
+        )
+        pinned_hash = contract_hash if (isinstance(contract_hash, str) and default_config) else None
     if pinned_hash is not None and layout_hash != pinned_hash:
         raise ProtocolMismatch(f"handshake layout_hash={layout_hash} but {pinned_hash} is required")
     clamp = _verify_clamp(hello.get("obs_clamp"))
@@ -318,6 +359,7 @@ def verify_handshake(
     layout = hello.get("layout")
     if not isinstance(layout, Mapping) or not isinstance(layout.get("blocks"), list):
         raise ProtocolMismatch("handshake carries no layout block table")
+    _verify_observation_config(hello, layout)
     if layout.get("obs_len") is not None and layout["obs_len"] != obs_len:
         raise ProtocolMismatch(
             f"layout obs_len={layout['obs_len']!r} does not match the handshake's {obs_len}"
@@ -341,6 +383,48 @@ def verify_handshake(
         value = hello.get(key)
         if not isinstance(value, int) or value <= 0:
             raise ProtocolMismatch(f"handshake {key}={value!r} is not a positive integer")
+
+
+#: Keys every ``ashcrown-obs-v2`` handshake publishes in ``observation_config``.
+OBS_CONFIG_KEYS = (
+    "obs_grid",
+    "obs_grid_radius",
+    "perception_px",
+    "expose_portal",
+    "obs_blocked",
+)
+
+
+def _verify_observation_config(hello: Mapping[str, Any], layout: Mapping[str, Any]) -> None:
+    """The layout's observation config must agree with the blocks it publishes.
+
+    ``ashcrown-obs-v2`` resolves the layout from the observation config, so a
+    table that claims ``obs_grid=false`` while publishing a grid block (or the
+    reverse) would make the client slice the wrong floats.
+    """
+    config = hello.get("observation_config", layout.get("observation_config"))
+    if config is None:
+        return
+    if not isinstance(config, Mapping):
+        raise ProtocolMismatch(f"handshake observation_config={config!r} is not an object")
+    missing = [key for key in OBS_CONFIG_KEYS if key not in config]
+    if missing:
+        raise ProtocolMismatch(f"observation_config is missing {missing}")
+    has_grid_block = any(
+        isinstance(block, Mapping) and block.get("name") == "grid" for block in layout["blocks"]
+    )
+    if bool(config["obs_grid"]) != has_grid_block:
+        raise ProtocolMismatch(
+            f"observation_config.obs_grid={config['obs_grid']!r} but the block table "
+            f"{'has' if has_grid_block else 'has no'} grid block"
+        )
+    layout_config = layout.get("observation_config")
+    if isinstance(layout_config, Mapping) and dict(layout_config) != dict(config):
+        raise ProtocolMismatch("the handshake observation_config disagrees with the layout's copy")
+    grid = layout.get("grid")
+    if isinstance(grid, Mapping) and "enabled" in grid:
+        if bool(grid["enabled"]) != bool(config["obs_grid"]):
+            raise ProtocolMismatch("layout.grid.enabled disagrees with observation_config")
 
 
 def _verify_clamp(value: Any) -> tuple[float, float]:
@@ -376,6 +460,7 @@ class AshCrownClient:
         *,
         compat: Mapping[str, Any] | None = None,
         expected_layout_hash: str | None = None,
+        expected_obs_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = int(port)
@@ -383,6 +468,7 @@ class AshCrownClient:
         self.hello: dict[str, Any] | None = None
         self._compat = compat
         self._expected_layout_hash = expected_layout_hash
+        self._expected_obs_config = expected_obs_config
         self._socket: socket.socket | None = None
         self._decoder = FrameDecoder()
         self._pending: list[Frame] = []
@@ -403,7 +489,12 @@ class AshCrownClient:
         self._pending = []
         try:
             frame = self._receive()
-            verify_handshake(frame.payload, self._compat, self._expected_layout_hash)
+            verify_handshake(
+                frame.payload,
+                self._compat,
+                self._expected_layout_hash,
+                self._expected_obs_config,
+            )
         except ProtocolError:
             self._socket.close()
             self._socket = None
@@ -445,8 +536,11 @@ class AshCrownClient:
         character: str = DEFAULT_CHARACTER,
         frame_skip: int | None = None,
         max_ticks: int | None = None,
-        obs_grid: bool = True,
-        obs_grid_radius: int = DEFAULT_OBS_GRID_RADIUS,
+        obs_grid: bool | None = None,
+        obs_grid_radius: int | None = None,
+        perception_px: float | None = None,
+        expose_portal: bool | None = None,
+        obs_blocked: bool | None = None,
         reward_profile: str = DEFAULT_REWARD_PROFILE,
         reward_overrides: Mapping[str, float] | None = None,
         hash_every_ticks: int = DEFAULT_HASH_EVERY_TICKS,
@@ -457,10 +551,24 @@ class AshCrownClient:
         ``seed=None`` lets the engine draw one (it is returned in ``info``).
         ``frame_skip=None`` uses the handshake's ``frame_skip_default``;
         ``max_ticks=None`` omits the field so the engine applies its level
-        default (18,000 ticks, ``docs/07`` §4.2).
+        default (18,000 ticks, ``docs/07`` §4.2). The observation config fields
+        default to the **handshake's** ``observation_config`` (the process was
+        launched with it and treats it as a lifetime key, ``docs/07`` §5.1).
         """
+        hello = self._hello()
         if frame_skip is None:
-            frame_skip = int(self._hello()["frame_skip_default"])
+            frame_skip = int(hello["frame_skip_default"])
+        published = hello.get("observation_config") or {}
+        if obs_grid is None:
+            obs_grid = bool(published.get("obs_grid", DEFAULT_OBS_GRID))
+        if obs_grid_radius is None:
+            obs_grid_radius = int(published.get("obs_grid_radius", DEFAULT_OBS_GRID_RADIUS))
+        if perception_px is None:
+            perception_px = float(published.get("perception_px", DEFAULT_PERCEPTION_PX))
+        if expose_portal is None:
+            expose_portal = bool(published.get("expose_portal", DEFAULT_EXPOSE_PORTAL))
+        if obs_blocked is None:
+            obs_blocked = bool(published.get("obs_blocked", DEFAULT_OBS_BLOCKED))
         payload: dict[str, Any] = {
             "cmd": "reset",
             "mode": mode,
@@ -469,6 +577,9 @@ class AshCrownClient:
             "frame_skip": int(frame_skip),
             "obs_grid": bool(obs_grid),
             "obs_grid_radius": int(obs_grid_radius),
+            "perception_px": float(perception_px),
+            "expose_portal": bool(expose_portal),
+            "obs_blocked": bool(obs_blocked),
             "reward_profile": reward_profile,
             "reward_overrides": dict(reward_overrides or {}),
             "hash_every_ticks": int(hash_every_ticks),
@@ -574,8 +685,18 @@ __all__ = [
     "DEFAULT_HASH_EVERY_TICKS",
     "DEFAULT_MAX_TICKS",
     "DEFAULT_MODE",
+    "DEFAULT_EXPOSE_PORTAL",
+    "DEFAULT_OBS_BLOCKED",
+    "DEFAULT_OBS_GRID",
     "DEFAULT_OBS_GRID_RADIUS",
+    "DEFAULT_PERCEPTION_PX",
     "DEFAULT_REWARD_PROFILE",
+    "GRID_RADIUS_MAX",
+    "GRID_RADIUS_MIN",
+    "OBS_CONFIG_KEYS",
+    "PERCEPTION_PX_MAX",
+    "PERCEPTION_PX_MIN",
+    "STRICT_PERCEPTION_PX",
     "DEFAULT_TIMEOUT",
     "Frame",
     "FrameDecoder",

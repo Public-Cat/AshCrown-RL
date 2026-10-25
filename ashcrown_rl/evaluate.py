@@ -315,6 +315,7 @@ def evaluate(
             "action_schema": env.hello.get("action_schema"),
             "layout_hash": env.layout_hash,
             "obs_len": env.obs_len,
+            "observation_config": env.observation_config(),
             "physics_ticks_per_second": env.hello.get("physics_ticks_per_second"),
             "frame_skip": env.frame_skip,
         }
@@ -325,6 +326,7 @@ def evaluate(
             "frame_skip": env.frame_skip,
             "max_ticks": env.max_ticks,
             "reward_profile": env.reward_profile,
+            **env.observation_config(),
             "policy": policy_name,
             "seeds": [int(seed) for seed in seeds],
             "repeat": int(repeat),

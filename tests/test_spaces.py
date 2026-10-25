@@ -7,6 +7,8 @@ test at the bottom (which skips cleanly without a game checkout).
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -15,10 +17,12 @@ from ashcrown_rl.protocol import load_compat
 from ashcrown_rl.spaces import (
     ENEMIES,
     GLOBAL,
+    HAZARDS,
     PX_PER_CELL,
     Block,
     Layout,
     LayoutError,
+    fixture_path,
     grid_delta,
     load_fixture_layout,
     normalise,
@@ -27,7 +31,7 @@ from ashcrown_rl.spaces import (
 
 
 def test_fixture_parses_the_published_table(layout: Layout) -> None:
-    assert layout.obs_len == 3246
+    assert layout.obs_len == 3254
     assert [block.name for block in layout.blocks] == [
         "global",
         "player",
@@ -202,7 +206,7 @@ def test_fixture_is_the_layout_the_compat_file_pins(layout: Layout) -> None:
     """The stored layout is the one ``compat.json`` pins (guards fixture drift)."""
     pinned = load_compat()["layout_hash"]
     assert len(pinned) == 64
-    assert layout.obs_len == 3246
+    assert layout.obs_len == 3254
     assert layout.obs_schema == load_compat()["obs_schema"]
     assert layout.action_schema == load_compat()["action_schema"]
     assert layout.protocol == load_compat()["protocol"]
@@ -223,3 +227,110 @@ def test_live_handshake_matches_the_stored_layout_fixture(env_kwargs: dict) -> N
     assert fixture.enemy_types == live.enemy_types
     assert fixture.grid_channels == live.grid_channels
     assert fixture.obs_len == live.obs_len
+
+
+# --------------------------------------------------------------------------- #
+# v2: the layout is a function of the observation config (RL-6)
+# --------------------------------------------------------------------------- #
+def _fixture_dict() -> dict:
+    return json.loads(fixture_path().read_text(encoding="utf-8"))
+
+
+def _no_grid_layout() -> Layout:
+    """The table the engine publishes for ``obs_grid=false`` (608 floats)."""
+    raw = _fixture_dict()
+    raw["blocks"] = [block for block in raw["blocks"] if block["name"] != "grid"]
+    raw["obs_len"] = 608
+    raw["observation_config"] = {**raw["observation_config"], "obs_grid": False}
+    raw["grid"] = {
+        "enabled": False,
+        "radius": 0,
+        "size": 0,
+        "channels": 0,
+        "channel_names": [],
+    }
+    return Layout.from_layout_dict(raw)
+
+
+def _radius_layout(radius: int) -> Layout:
+    """A copy of the fixture table with a resized grid block."""
+    raw = _fixture_dict()
+    size = radius * 2 + 1
+    channels = len(raw["grid"]["channel_names"])
+    grid = raw["blocks"][-1]
+    assert grid["name"] == "grid"
+    grid["shape"] = [channels, size, size]
+    grid["size"] = channels * size * size
+    raw["obs_len"] += grid["size"] - 6 * 21 * 21
+    raw["grid"]["radius"] = radius
+    raw["grid"]["size"] = size
+    raw["observation_config"] = {**raw["observation_config"], "obs_grid_radius": radius}
+    return Layout.from_layout_dict(raw)
+
+
+def test_layout_without_grid_has_no_slice_and_no_grid_geometry() -> None:
+    layout = _no_grid_layout()
+    assert layout.obs_len == 608
+    assert layout.grid_enabled is False
+    assert layout.grid_radius == 0
+    assert layout.grid_size == 0
+    assert not layout.has_block("grid")
+    with pytest.raises(LayoutError, match="no 'grid' block"):
+        layout.block("grid")
+    obs = np.zeros(layout.obs_len, dtype=np.float32)
+    with pytest.raises(LayoutError, match="obs_grid=false"):
+        layout.grid(obs)
+
+
+def test_layout_radius_changes_the_grid_shape_and_indexing() -> None:
+    for radius in (4, 21):
+        layout = _radius_layout(radius)
+        size = radius * 2 + 1
+        assert layout.grid_enabled is True
+        assert layout.grid_radius == radius
+        assert layout.grid_size == size
+        assert layout.block("grid").shape == (6, size, size)
+        assert layout.obs_len == 608 + 6 * size * size
+        assert layout.observation_config["obs_grid_radius"] == radius
+        obs = np.zeros(layout.obs_len, dtype=np.float32)
+        obs[layout.offset(GLOBAL, "level")] = 0.3
+        grid = layout.grid(obs)
+        assert grid.shape == (6, size, size)
+        # centre cell of the window
+        assert layout.grid_index(0, 0) == radius * size + radius
+        with pytest.raises(LayoutError, match="outside"):
+            layout.grid_index(radius + 1, 0)
+        assert layout.cell(grid, 0, 0, "floor") == 0.0
+
+
+def test_layout_rejects_a_grid_that_disagrees_with_its_config() -> None:
+    raw = _fixture_dict()
+    raw["observation_config"] = {**raw["observation_config"], "obs_grid": False}
+    with pytest.raises(LayoutError, match="obs_grid is false"):
+        Layout.from_layout_dict(raw)
+    raw_dict = _fixture_dict()
+    raw_dict["blocks"] = [b for b in raw_dict["blocks"] if b["name"] != "grid"]
+    raw_dict["obs_len"] = 608
+    raw_dict["observation_config"] = {**raw_dict["observation_config"], "obs_grid": True}
+    with pytest.raises(LayoutError, match="no grid block"):
+        Layout.from_layout_dict(raw_dict)
+
+
+def test_hazard_slot_publishes_the_v2_telegraph_features(layout: Layout) -> None:
+    fields = layout.block(HAZARDS).fields
+    assert fields[:6] == (
+        "present",
+        "rel_x",
+        "rel_y",
+        "radius",
+        "remaining",
+        "kind",
+    ), "v1's six features keep their order"
+    assert fields[6:] == ("telegraph_fraction", "coverage")
+    assert layout.block(HAZARDS).shape == (4, 8)
+    obs = np.zeros(layout.obs_len, dtype=np.float32)
+    hazards = layout.matrix(obs, HAZARDS)
+    hazards[0, layout.index(HAZARDS, "telegraph_fraction")] = 0.25
+    hazards[0, layout.index(HAZARDS, "coverage")] = 0.5
+    assert layout.matrix(obs, HAZARDS)[0, 6] == pytest.approx(0.25)
+    assert layout.matrix(obs, HAZARDS)[0, 7] == pytest.approx(0.5)

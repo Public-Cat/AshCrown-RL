@@ -172,7 +172,7 @@ class ActionSpec:
 
 @dataclass(frozen=True)
 class Layout:
-    """Parsed ``ashcrown-obs-v1`` layout (built from the handshake)."""
+    """Parsed ``ashcrown-obs-v2`` layout (built from the handshake)."""
 
     obs_len: int
     blocks: tuple[Block, ...]
@@ -185,6 +185,11 @@ class Layout:
     grid_channels: tuple[str, ...]
     rel_cell_scale: float
     perception_radius: float
+    #: False when the layout was published with ``obs_grid=false`` (RL-6).
+    grid_enabled: bool = True
+    #: The published observation config (``obs_grid``, radius, perception,
+    #: portal assist, blocked channel); empty for a v1 fixture.
+    observation_config: Mapping[str, Any] = field(default_factory=dict)
     protocol: int = 0
     obs_schema: str = ""
     action_schema: str = ""
@@ -250,6 +255,14 @@ class Layout:
         if not isinstance(directions, list) or len(directions) < 9:
             raise LayoutError("layout carries no 9-entry action direction table")
         grid = layout.get("grid") or {}
+        has_grid_block = any(block.name == GRID for block in blocks)
+        observation_config = layout.get("observation_config") or {}
+        # The observation config is authoritative when published; the older
+        # `grid.enabled` flag and the block table are the fallbacks.
+        if isinstance(observation_config, Mapping) and "obs_grid" in observation_config:
+            grid_enabled = bool(observation_config["obs_grid"])
+        else:
+            grid_enabled = bool(grid.get("enabled", has_grid_block))
         channels = blocks[-1].channels if blocks[-1].name == GRID else ()
         instance = cls(
             obs_len=offset,
@@ -262,7 +275,13 @@ class Layout:
             grid_size=int(grid.get("size", 0)),
             grid_channels=tuple(str(value) for value in grid.get("channel_names") or channels),
             rel_cell_scale=float(layout.get("rel_cell_scale", 32.0)),
-            perception_radius=float(layout.get("perception_radius", 0.0)),
+            perception_radius=float(
+                observation_config.get("perception_px", layout.get("perception_radius", 0.0))
+            ),
+            grid_enabled=grid_enabled,
+            observation_config=(
+                dict(observation_config) if isinstance(observation_config, Mapping) else {}
+            ),
             protocol=int(layout.get("protocol", 0)),
             obs_schema=str(layout.get("obs_schema", "")),
             action_schema=str(layout.get("action_schema", "")),
@@ -285,10 +304,14 @@ class Layout:
         if self.enemy_types and len(enemy.fields) != enemy.shape[1]:
             raise LayoutError("enemy slot fields do not match the published shape")
         if GRID in self._blocks:
+            if not self.grid_enabled:
+                raise LayoutError("layout publishes a grid block but obs_grid is false")
             grid = self._blocks[GRID]
             expected = (len(self.grid_channels), self.grid_size, self.grid_size)
             if grid.shape != expected:
                 raise LayoutError(f"grid block shape {grid.shape} != {expected}")
+        elif self.grid_enabled:
+            raise LayoutError("layout has no grid block but obs_grid is true")
 
     def _build_actions(self) -> tuple[ActionSpec, ...]:
         """Screen vector and iso grid step of every action (derived, not literal)."""
@@ -362,7 +385,15 @@ class Layout:
         return self.block(name).array(obs)
 
     def grid(self, obs: np.ndarray) -> np.ndarray:
-        """Local terrain grid as ``(channels, size, size)``."""
+        """Local terrain grid as ``(channels, size, size)``.
+
+        Raises :class:`LayoutError` when the observation was published with
+        ``obs_grid=false`` (there is no grid block to slice).
+        """
+        if not self.grid_enabled:
+            raise LayoutError(
+                "this layout has no grid block (obs_grid=false); the heuristic needs obs_grid=True"
+            )
         return self.block(GRID).array(obs)
 
     def slices(self) -> dict[str, list[int]]:
@@ -466,6 +497,10 @@ class Layout:
     def hazard(self, grid: np.ndarray, dx: int, dy: int) -> float:
         """``hazard`` channel of a local cell (live telegraph coverage)."""
         return self.cell(grid, dx, dy, "hazard")
+
+    def blocked(self, grid: np.ndarray, dx: int, dy: int) -> float:
+        """Optional ``blocked`` channel (physics point query, RL-6)."""
+        return self.cell(grid, dx, dy, "blocked")
 
     # -- semantic accessors ------------------------------------------------- #
     def player_features(self, obs: np.ndarray) -> PlayerFeatures:

@@ -228,6 +228,12 @@ def heuristic_action(
     player = resolved.player_features(obs)
     if not player.alive:
         return np.zeros(3, dtype=np.int64)
+    if not resolved.grid_enabled:
+        # ``obs_grid=false``: no local window to path through. Fall back to a
+        # bearing-only policy (approach/strike the nearest perceived enemy, walk
+        # the portal bearing, otherwise sweep) so the same heuristic still runs
+        # in the ablation's grid-less variant.
+        return _blind_action(resolved, obs, player, info, config)
     grid = resolved.grid(obs)
     previous = _previous_move(info)
 
@@ -243,6 +249,36 @@ def heuristic_action(
     if portal.active:
         return _enter_portal(resolved, grid, portal, previous, config)
     return _action(_explore_step(resolved, grid, portal, previous, config, explore_target), 0, 0)
+
+
+def _blind_action(
+    layout: Layout,
+    obs: np.ndarray,
+    player: PlayerFeatures,
+    info: Mapping[str, Any] | None,
+    config: HeuristicConfig,
+) -> np.ndarray:
+    """Bearing-only fallback for a layout without the local grid (RL-6).
+
+    It has no pathfinding there, so it walks straight at what it can see and
+    otherwise sweeps the eight axes every two seconds. It is deliberately
+    simple: the grid-less ablation is meant to measure how much the local map is
+    worth, not to win.
+    """
+    enemies = [slot for slot in layout.perceived_enemies(obs) if not slot.dead]
+    if enemies:
+        nearest = enemies[0]
+        reach = player.attack_reach_px + config.strike_margin_px
+        if nearest.screen_distance_px <= reach:
+            return np.array([0, 1, 0], dtype=np.int64)
+        return np.array([layout.move_index(nearest.screen_delta_cells), 0, 0], dtype=np.int64)
+    portal = layout.portal(obs)
+    if portal.active and portal.distance_cells <= config.portal_interact_cells:
+        return np.array([0, 0, 1], dtype=np.int64)
+    if float(np.hypot(*portal.bearing)) > 0.0:
+        return np.array([layout.move_index(portal.bearing), 0, 0], dtype=np.int64)
+    tick = int((info or {}).get("tick", 0))
+    return np.array([1 + (tick // 120) % 8, 0, 0], dtype=np.int64)
 
 
 # --------------------------------------------------------------------------- #
@@ -1257,6 +1293,10 @@ class HeuristicPolicy:
         self, obs: np.ndarray, info: Mapping[str, Any] | None = None, layout: Layout | None = None
     ) -> np.ndarray:
         resolved = layout or self.layout
+        if not resolved.grid_enabled:
+            # No local window: the global-map wrapper has nothing to learn from,
+            # so the pure bearing fallback is the whole policy (RL-6 ablation).
+            return heuristic_action(obs, info, resolved, self.config)
         action = heuristic_action(obs, info, resolved, self.config)
         navigation = self._nav_move(resolved, obs, info)
         if navigation:

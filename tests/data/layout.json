@@ -185,15 +185,17 @@
         "rel_y",
         "radius",
         "remaining",
-        "kind"
+        "kind",
+        "telegraph_fraction",
+        "coverage"
       ],
       "name": "hazards",
       "offset": 559,
       "shape": [
         4,
-        6
+        8
       ],
-      "size": 24
+      "size": 32
     },
     {
       "fields": [
@@ -204,7 +206,7 @@
         "within_interact_range"
       ],
       "name": "merchant",
-      "offset": 583,
+      "offset": 591,
       "size": 5
     },
     {
@@ -223,7 +225,7 @@
         "merchant_bought"
       ],
       "name": "events",
-      "offset": 588,
+      "offset": 596,
       "size": 12
     },
     {
@@ -236,7 +238,7 @@
         "visited"
       ],
       "name": "grid",
-      "offset": 600,
+      "offset": 608,
       "shape": [
         6,
         21,
@@ -276,11 +278,19 @@
       "visited"
     ],
     "channels": 6,
+    "enabled": true,
     "radius": 10,
     "size": 21
   },
-  "obs_len": 3246,
-  "obs_schema": "ashcrown-obs-v1",
+  "obs_len": 3254,
+  "obs_schema": "ashcrown-obs-v2",
+  "observation_config": {
+    "expose_portal": true,
+    "obs_blocked": false,
+    "obs_grid": true,
+    "obs_grid_radius": 10,
+    "perception_px": 900.0
+  },
   "perception_radius": 900.0,
   "pickup_kinds": [
     "gold",

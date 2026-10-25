@@ -726,3 +726,80 @@ def test_pack_gates_are_off_by_default() -> None:
     assert DEFAULT_CONFIG.queue_gate is False
     assert DEFAULT_CONFIG.chokepoint is False
     assert DEFAULT_CONFIG.isolate_target is False
+
+
+# --------------------------------------------------------------------------- #
+# RL-6: the heuristic on v2 layouts (grid off, non-default radius)
+# --------------------------------------------------------------------------- #
+def _no_grid_layout() -> Layout:
+    import json
+
+    from ashcrown_rl.spaces import fixture_path
+
+    raw = json.loads(fixture_path().read_text(encoding="utf-8"))
+    raw["blocks"] = [block for block in raw["blocks"] if block["name"] != "grid"]
+    raw["obs_len"] = 608
+    raw["observation_config"] = {**raw["observation_config"], "obs_grid": False}
+    raw["grid"] = {"enabled": False, "radius": 0, "size": 0, "channels": 0, "channel_names": []}
+    return Layout.from_layout_dict(raw)
+
+
+def _blind_obs(layout: Layout) -> np.ndarray:
+    obs = np.zeros(layout.obs_len, dtype=np.float32)
+    obs[layout.offset("player", "alive")] = 1.0
+    obs[layout.offset("player", "hp_frac")] = 1.0
+    obs[layout.offset("player", "attack_reach")] = 43.0 / 100.0
+    obs[layout.offset("player", "state_idle")] = 1.0
+    return obs
+
+
+def test_gridless_layout_keeps_the_heuristic_running() -> None:
+    """``obs_grid=false`` has no window to path through: bearing-only fallback."""
+    layout = _no_grid_layout()
+    obs = _blind_obs(layout)
+    obs[layout.offset("global", "portal_active")] = 1.0
+    obs[layout.offset("global", "portal_rel_x")] = 0.5
+    obs[layout.offset("global", "portal_distance")] = 0.5
+    action = heuristic_action(obs, layout=layout)
+    assert action[0] != 0, "walks the portal bearing instead of raising"
+    assert action[1] == 0
+
+    # No portal bearing and no enemy: it still returns a legal sweep move.
+    bare = _blind_obs(layout)
+    assert heuristic_action(bare, info={"tick": 0}, layout=layout)[0] == 1
+    assert heuristic_action(bare, info={"tick": 240}, layout=layout)[0] == 3
+
+
+def test_gridless_layout_attacks_an_enemy_in_reach() -> None:
+    layout = _no_grid_layout()
+    obs = _blind_obs(layout)
+    block = layout.block("enemies")
+    row = np.zeros(block.shape[1], dtype=np.float32)
+    row[layout.index("enemies", "present")] = 1.0
+    row[layout.index("enemies", "hp_frac")] = 1.0
+    row[layout.index("enemies", "state_chase")] = 1.0
+    row[layout.index("enemies", "rel_x")] = 0.5 / layout.rel_cell_scale
+    row[layout.index("enemies", "distance")] = 0.5 / layout.rel_cell_scale
+    row[layout.index("enemies", "attack_reach")] = 50.0 / 200.0
+    obs[block.offset : block.offset + block.shape[1]] = row
+    action = heuristic_action(obs, layout=layout)
+    assert action[1] == 1, "swings from inside reach + strike margin"
+
+
+@pytest.mark.integration
+def test_heuristic_runs_on_a_radius_21_observation(env_kwargs: dict[str, Any]) -> None:
+    """The heuristic slices by name, so a non-default radius is transparent."""
+    env = AshCrownEnv(obs_grid_radius=21, **env_kwargs)
+    try:
+        assert env.obs_len == 608 + 6 * 43 * 43
+        obs, info = env.reset(seed=20260124)
+        policy = HeuristicPolicy(env.layout)
+        for _ in range(5):
+            action = policy(obs, info, env.layout)
+            assert 0 <= int(action[0]) <= 8
+            obs, reward, terminated, truncated, info = env.step(action)
+            assert obs.shape == (env.obs_len,)
+            if terminated or truncated:
+                break
+    finally:
+        env.close()

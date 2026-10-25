@@ -83,16 +83,33 @@ parent of `training/`) and the binary (`ASHCROWN_GODOT`, `GODOT_BIN`, then
 
 | API | Behaviour |
 |---|---|
-| `observation_space` | `Box(-1, 1, (obs_len,), float32)`, `obs_len = 3246` at grid radius 10 |
+| `observation_space` | `Box(-1, 1, (obs_len,), float32)` built from the handshake: `obs_len = 3254` at the default config (grid on, radius 10), `608` with `obs_grid=False` |
 | `action_space` | `MultiDiscrete([9, 2, 2])` → `[move, attack, interact]` |
-| `metadata` | `render_modes`, `obs_layout` (block table, grid geometry, layout hash), `action_meanings` |
+| `metadata` | `render_modes`, `obs_layout` (block table, grid geometry, observation config, layout hash), `action_meanings` |
 | `reset(seed=None, options={})` | seeds the engine episode; options: `level`, `character`, `max_ticks`, `reward_profile`, `reward_overrides`, `merchant_policy` |
 | `step(action)` | one decision window = `frame_skip` physics ticks; returns the Gym 5-tuple |
 | auto-reset | **never** — call `reset()`; the vector wrapper auto-resets |
 | `close()` | sends `close`, reaps the process, idempotent |
 
-`render_mode` is `None` (headless only in v1) and the local terrain grid is
-fixed on at radius 10 (RL-2 constraint).
+`render_mode` is `None` (headless only). The **observation config** is a
+constructor argument (RL-6), passed to the engine at launch so the handshake
+layout and the Gym space always agree — and a lifetime key of the process:
+
+| option | default | accepted |
+|---|---|---|
+| `obs_grid` | `True` | `False` drops the grid block from the vector (no zeros) |
+| `obs_grid_radius` | `10` | `4..21` |
+| `perception_px` | `900.0` | `100..5000` (`300` = strict / human-visible) |
+| `expose_portal` | `True` | `False` zeroes the portal sub-block |
+| `obs_blocked` | `False` | adds a physics-query `blocked` grid channel (costly, see the ablation) |
+
+```python
+env = AshCrownEnv(obs_grid_radius=21, perception_px=300.0)
+print(env.obs_len, env.layout.observation_config)  # 11702, {...}
+```
+
+A non-default config has its own `layout_hash`. `compat.json` pins the default
+one; a custom config is verified by exact `observation_config` equality.
 
 Determinism (`docs/07` §10): the same seed + the same action sequence produce
 the same `info["state_hash"]` sequence across processes — including across
@@ -158,9 +175,14 @@ environment from level 1 to the **victory** terminal on seed 20260101.
 
 ## Observation, action and reward reference
 
-Generated from the handshake layout table (`layout_hash
-fc8c0f26ccca4d8eef3ccbc8faa19cb2f78e27b5159913ef252648dc414ece1a`) — the
-client never hardcodes an offset, it slices by block name.
+Generated from the handshake layout table for the **default** observation
+config (`layout_hash
+fbcc9cdae85af53a8b0ee38ad6b81137168bb7fc2639dc1966cca75d01560d15`, grid on,
+radius 10, perception 900, portal assist on, blocked off) — the client never
+hardcodes an offset, it slices by block name. A different config publishes its
+own offsets/`obs_len`/hash; re-run `godot --headless --path . -s
+tools/rl/dump_layout.gd -- --write-fixture` in the game repo after a schema
+change to refresh `tests/data/layout.json`.
 
 ### Blocks
 
@@ -170,10 +192,10 @@ client never hardcodes an offset, it slices by block name.
 | `player` | 31 | 24 | (24,) |
 | `enemies` | 55 | 468 | (12, 39) |
 | `pickups` | 523 | 36 | (4, 9) |
-| `hazards` | 559 | 24 | (4, 6) |
-| `merchant` | 583 | 5 | (5,) |
-| `events` | 588 | 12 | (12,) |
-| `grid` | 600 | 2646 | (6, 21, 21) |
+| `hazards` | 559 | 32 | (4, 8) |
+| `merchant` | 591 | 5 | (5,) |
+| `events` | 596 | 12 | (12,) |
+| `grid` | 608 | 2646 | (6, 21, 21) |
 
 ### Global block (0–30, 31 floats)
 
@@ -287,13 +309,13 @@ client never hardcodes an offset, it slices by block name.
 ### Pickup, hazard and merchant blocks
 
 `pickups`: 4 slots × 9 = 36 floats — `present`, `kind_gold`, `kind_gem_red`, `kind_gem_blue`, `kind_gem_green`, `kind_gem_white`, `rel_x`, `rel_y`, `distance`
-`hazards`: 4 slots × 6 = 24 floats — `present`, `rel_x`, `rel_y`, `radius`, `remaining`, `kind`
+`hazards`: 4 slots × 8 = 32 floats — `present`, `rel_x`, `rel_y`, `radius`, `remaining`, `kind`, `telegraph_fraction` (remaining/total), `coverage` (1 − player_distance / (radius + 8 px))
 
 `merchant`: 5 floats — `present`, `rel_x`, `rel_y`, `distance`, `within_interact_range`
 
 `events`: 12 floats — `damage_dealt`, `damage_taken`, `kills`, `gold_gained`, `gems_gained`, `attacks_started`, `hits_landed`, `player_healed`, `level_cleared`, `died`, `portal_entered`, `merchant_bought`
 
-`grid`: (6, 21, 21) channel-major, channels `floor`, `wall`, `solid_prop`, `doorway`, `hazard`, `visited`
+`grid`: `(channels, 2R+1, 2R+1)` channel-major, channels `floor`, `wall`, `solid_prop`, `doorway`, `hazard`, `visited` (+ `blocked` when `obs_blocked=True`); absent entirely when `obs_grid=False`.
 
 ### Actions (`MultiDiscrete([9, 2, 2])`)
 
@@ -388,9 +410,17 @@ Leave stale port files alone: each launch uses a fresh temporary file.
 engine runs before it accepts a client (`docs/07` §4.2). It is required for
 bit-identical replays and happens before the socket is bound.
 
-**`BAD_CONFIG` from `reset`** — `frame_skip`, `obs_grid` and `obs_grid_radius`
-are fixed for the life of a process; a reset may not change them. `obs_grid`
-must stay `true` and `obs_grid_radius` must be 10 in RL-2/RL-4.
+**`BAD_CONFIG` from `reset`** — `frame_skip` and the five observation-config
+keys (`obs_grid`, `obs_grid_radius`, `perception_px`, `expose_portal`,
+`obs_blocked`) are fixed for the life of a process; a reset may not change
+them. Pass the observation config to `AshCrownEnv(...)` (it goes to the engine
+as launch arguments, so the handshake matches), not to `reset()`.
+
+**A v1 handshake / checkpoint / log is refused** — `ashcrown-obs-v1` had a
+3,246-float vector (hazards 6 wide, fixed radius 10) and a different
+`layout_hash`; `verify_handshake` and `replay` raise a `ProtocolMismatch` /
+`ValueError` naming the schema or hash instead of slicing the wrong floats.
+Re-train/re-record; see the game repo's `docs/07` §8.5.1 for the migration.
 
 **Replay diverges** — `python -m ashcrown_rl.replay replay` names the first
 differing step and prints a bounded state diff of that step (the recorded vs
@@ -422,7 +452,15 @@ and always `close()` it.
   victory/death terminals), the `auto_heal` merchant sub-policy, the Python
   `mode="run"` option, the run-mode smoke script and the GUT scripted clear
   harness. See the game repository's `docs/artifacts/RL/RL5-report.md`.
-- **RL-6 / RL-7 (next)**: observation v2, then the PPO pipeline.
+- **RL-6 (landed)**: `ashcrown-obs-v2` — the layout is resolved from a
+  published observation config (grid on/off, radius 4–21, perception,
+  portal assist, optional blocked channel), hazard slots gained
+  `telegraph_fraction` + `coverage`, and the client derives every slice from
+  the handshake. The ablation (`scripts/ablate_obs.py`,
+  `docs/artifacts/RL/ablation_obs_v2.csv`) shows the grid and the portal assist
+  are what the heuristic needs; the default v2 config keeps the 8/10
+  acceptance. See the game repo's `docs/artifacts/RL/RL6-report.md`.
+- **RL-7 (next)**: the PPO pipeline.
 
 ## Licence
 

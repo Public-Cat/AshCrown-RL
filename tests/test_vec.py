@@ -59,7 +59,7 @@ def test_reset_and_step_are_batched_and_autoreset_leaves_the_final_obs(
     vec_env: AshCrownVectorEnv,
 ) -> None:
     obs, infos = vec_env.reset()
-    assert obs.shape == (2, 3246)
+    assert obs.shape == (2, 3254)
     assert obs.dtype == np.float32
     assert np.all(np.isfinite(obs))
     assert "obs_schema" in infos
@@ -72,7 +72,7 @@ def test_reset_and_step_are_batched_and_autoreset_leaves_the_final_obs(
     saw_terminal = False
     for _ in range(60):
         obs, rewards, terminated, truncated, infos = vec_env.step(actions)
-        assert obs.shape == (2, 3246)
+        assert obs.shape == (2, 3254)
         assert rewards.shape == (2,)
         assert terminated.shape == (2,) and truncated.shape == (2,)
         if np.any(terminated | truncated):
@@ -82,7 +82,7 @@ def test_reset_and_step_are_batched_and_autoreset_leaves_the_final_obs(
             assert "final_obs" in infos
             finals = [value for value in infos["final_obs"] if value is not None]
             assert finals, "the autoreset step must expose the final observation"
-            assert all(np.asarray(value).shape == (3246,) for value in finals)
+            assert all(np.asarray(value).shape == (3254,) for value in finals)
             break
     assert saw_terminal, "a 120-tick episode must end within 60 decisions"
     # Both workers auto-reset independently and keep stepping.

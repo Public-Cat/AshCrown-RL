@@ -539,7 +539,7 @@ def test_live_handshake_matches_the_compat_contract(live_client: AshCrownClient)
     verify_handshake(hello, load_compat())
     assert hello["layout_hash"] == load_compat()["layout_hash"]
     assert hello["obs_clamp"] == [-1.0, 1.0]
-    assert hello["obs_len"] == 3246
+    assert hello["obs_len"] == 3254
     assert hello["character_ids"] == ["warrior", "knight", "fighter"]
     assert hello["physics_ticks_per_second"] == 60
     assert hello["frame_skip_default"] == 4
@@ -554,7 +554,7 @@ def test_live_handshake_matches_the_compat_contract(live_client: AshCrownClient)
 @pytest.mark.integration
 def test_live_reset_step_and_ping(live_client: AshCrownClient) -> None:
     obs, info = live_client.reset(seed=20260101)
-    assert obs.shape == (3246,)
+    assert obs.shape == (3254,)
     assert obs.dtype == np.float32
     assert np.all(np.isfinite(obs))
     assert info["seed"] == 20260101
@@ -566,7 +566,7 @@ def test_live_reset_step_and_ping(live_client: AshCrownClient) -> None:
     assert info["layout_hash"] == hello["layout_hash"]
 
     result = live_client.step(0, 0, 0)
-    assert result.obs.shape == (3246,)
+    assert result.obs.shape == (3254,)
     assert np.isfinite(result.reward)
     assert not result.terminated
     assert not result.truncated
@@ -584,7 +584,7 @@ def test_live_first_reset_after_warmup_accepts_a_custom_config() -> None:
     with GodotProcess(_launch_config()) as process:
         client = process.connect()
         obs, info = client.reset(seed=20260110, frame_skip=8, max_ticks=600)
-        assert obs.shape == (3246,), "the first client reset is accepted (used to be BAD_CONFIG)"
+        assert obs.shape == (3254,), "the first client reset is accepted (used to be BAD_CONFIG)"
         assert info["episode"] == 1
         result = client.step(0, 0, 0)
         assert result.info["step_ticks"] == 8, "the requested decision window is used"
@@ -654,7 +654,7 @@ def test_live_episode_done_and_reset(live_client: AshCrownClient) -> None:
         live_client.step(0, 0, 0)
     assert caught.value.code == "EPISODE_DONE"
     obs, info = live_client.reset(seed=20260103, max_ticks=600)
-    assert obs.shape == (3246,)
+    assert obs.shape == (3254,)
     assert info["tick"] == 0
 
 
@@ -748,10 +748,113 @@ def test_exported_binary_handshake_and_step() -> None:
     with GodotProcess(config) as process:
         client = process.connect()
         assert client.hello is not None
-        assert client.hello["obs_len"] == 3246
+        assert client.hello["obs_len"] == 3254
         obs, info = client.reset(seed=20260106, max_ticks=600)
-        assert obs.shape == (3246,)
+        assert obs.shape == (3254,)
         assert info["seed"] == 20260106
         result = client.step(0, 0, 0)
-        assert result.obs.shape == (3246,)
+        assert result.obs.shape == (3254,)
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# v2: observation config and the v1 refusal (RL-6)
+# --------------------------------------------------------------------------- #
+def test_verify_handshake_refuses_a_v1_handshake() -> None:
+    """An old ``ashcrown-obs-v1`` engine must be refused, never silently sliced."""
+    hello = {**_hello(), "obs_schema": "ashcrown-obs-v1"}
+    with pytest.raises(ProtocolMismatch, match="obs_schema"):
+        verify_handshake(hello, compat={})
+    hello = {**_hello(), "obs_schema": "ashcrown-obs-v1", "layout_hash": "a" * 64}
+    with pytest.raises(ProtocolMismatch, match="ashcrown-obs-v2"):
+        verify_handshake(hello, compat={"obs_schema": "ashcrown-obs-v2"})
+
+
+def _config_hello(config: dict[str, Any], *, blocks: list[dict[str, Any]] | None = None) -> dict:
+    hello = _hello(obs_len=sum(block["size"] for block in blocks or [{"size": 6}]))
+    hello["observation_config"] = config
+    hello["layout"] = {
+        "blocks": blocks or [{"name": "global", "offset": 0, "size": 6}],
+        "observation_config": dict(config),
+    }
+    return hello
+
+
+GRID_CONFIG = {
+    "obs_grid": True,
+    "obs_grid_radius": 10,
+    "perception_px": 900.0,
+    "expose_portal": True,
+    "obs_blocked": False,
+}
+GRID_BLOCKS = [
+    {"name": "global", "offset": 0, "size": 6},
+    {"name": "grid", "offset": 6, "size": 12},
+]
+
+
+def test_verify_handshake_checks_the_observation_config_against_the_blocks() -> None:
+    verify_handshake(_config_hello(GRID_CONFIG, blocks=GRID_BLOCKS), compat={})
+    # claims obs_grid=false while publishing a grid block
+    with pytest.raises(ProtocolMismatch, match="grid block"):
+        verify_handshake(
+            _config_hello({**GRID_CONFIG, "obs_grid": False}, blocks=GRID_BLOCKS), compat={}
+        )
+    # the handshake and the layout copies disagree
+    hello = _config_hello(GRID_CONFIG, blocks=GRID_BLOCKS)
+    hello["layout"]["observation_config"] = {**GRID_CONFIG, "perception_px": 300.0}
+    with pytest.raises(ProtocolMismatch, match="disagrees"):
+        verify_handshake(hello, compat={})
+    # layout.grid.enabled must match too
+    hello = _config_hello(GRID_CONFIG, blocks=GRID_BLOCKS)
+    hello["layout"]["grid"] = {"enabled": False, "radius": 0, "size": 0, "channels": 0}
+    with pytest.raises(ProtocolMismatch, match="grid.enabled"):
+        verify_handshake(hello, compat={})
+    # a requested non-default config is verified exactly
+    verify_handshake(
+        _config_hello({**GRID_CONFIG, "obs_grid_radius": 4}, blocks=GRID_BLOCKS),
+        compat={},
+        expected_obs_config={**GRID_CONFIG, "obs_grid_radius": 4},
+    )
+    with pytest.raises(ProtocolMismatch, match="obs_grid_radius"):
+        verify_handshake(
+            _config_hello(GRID_CONFIG, blocks=GRID_BLOCKS),
+            compat={},
+            expected_obs_config={**GRID_CONFIG, "obs_grid_radius": 4},
+        )
+
+
+@pytest.mark.integration
+def test_live_strict_observation_config_round_trips() -> None:
+    """A non-default config is pre-configured at launch and steps cleanly."""
+    strict = {
+        "obs_grid": True,
+        "obs_grid_radius": 4,
+        "perception_px": 300.0,
+        "expose_portal": False,
+        "obs_blocked": True,
+    }
+    args = (
+        "--rl-obs-grid=true",
+        "--rl-obs-grid-radius=4",
+        "--rl-perception-px=300.0",
+        "--rl-expose-portal=false",
+        "--rl-obs-blocked=true",
+    )
+    with GodotProcess(_launch_config(extra_args=args, obs_config=strict)) as process:
+        client = process.connect()
+        hello = client.hello
+        assert hello is not None
+        assert hello["obs_schema"] == OBS_SCHEMA
+        assert hello["observation_config"] == {
+            **strict,
+            "perception_px": 300.0,
+        }
+        expected_len = 608 + 7 * 9 * 9  # 7 channels (blocked), 9x9 window
+        assert hello["obs_len"] == expected_len
+        obs, info = client.reset(seed=20260120)
+        assert obs.shape == (expected_len,)
+        assert info["observation_config"] == hello["observation_config"]
+        result = client.step(0, 0, 0)
+        assert result.obs.shape == (expected_len,)
+        assert np.all(np.isfinite(result.obs))

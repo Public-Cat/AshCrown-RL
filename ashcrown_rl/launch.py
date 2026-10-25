@@ -119,6 +119,9 @@ class LaunchConfig:
     port_file: Path | None = None
     seed: int | None = None
     extra_args: tuple[str, ...] = ()
+    #: Observation config the client asked the process to publish (RL-6);
+    #: forwarded to the handshake check so a non-default layout verifies.
+    obs_config: dict[str, Any] | None = None
     env: dict[str, str] = field(default_factory=dict)
     scene_override_fallback: bool = True
 
@@ -259,6 +262,7 @@ class GodotProcess:
             host=self.config.host,
             port=int(self._ready["port"]),
             timeout=self.config.timeout_sec,
+            expected_obs_config=self.config.obs_config,
         )
         try:
             client.connect(timeout)

@@ -206,7 +206,7 @@ def test_reset_forwards_the_config_and_returns_a_valid_observation() -> None:
         assert call["hash_every_ticks"] == 60
         assert call["merchant_policy"] is None
         assert info["seed"] == 1234
-        assert info["obs_schema"] == "ashcrown-obs-v1"
+        assert info["obs_schema"] == "ashcrown-obs-v2"
         assert info["layout_hash"] == "a" * 64
         assert info["layout_slices"]["player"] == [31, 24]
         assert info["episode_steps"] == 0
@@ -340,7 +340,9 @@ def test_config_validation() -> None:
         AshCrownEnv(mode="combat", client_factory=StubClient)
     with pytest.raises(ValueError, match="merchant_policy"):
         AshCrownEnv(mode="run", merchant_policy="buy_all", client_factory=StubClient)
-    with pytest.raises(ValueError, match="obs_grid"):
+    # The stub publishes the default layout (grid on), so asking this env for a
+    # different observation config is refused instead of silently mismatching.
+    with pytest.raises(ValueError, match="observation_config"):
         AshCrownEnv(obs_grid=False, client_factory=StubClient)
     with pytest.raises(ValueError, match="frame_skip"):
         AshCrownEnv(frame_skip=0, client_factory=StubClient)
@@ -353,7 +355,30 @@ def test_config_validation() -> None:
     with pytest.raises(ValueError, match="reward_profile"):
         AshCrownEnv(reward_profile="imaginary", client_factory=StubClient)
     with pytest.raises(ValueError, match="obs_grid_radius"):
-        AshCrownEnv(obs_grid_radius=4, client_factory=StubClient)
+        AshCrownEnv(obs_grid_radius=3, client_factory=StubClient)
+    with pytest.raises(ValueError, match="obs_grid_radius"):
+        AshCrownEnv(obs_grid_radius=22, client_factory=StubClient)
+    with pytest.raises(ValueError, match="perception_px"):
+        AshCrownEnv(perception_px=10.0, client_factory=StubClient)
+    # The default config matches the published (fixture) layout exactly.
+    env = AshCrownEnv(client_factory=StubClient)
+    try:
+        assert env.observation_config() == {
+            "obs_grid": True,
+            "obs_grid_radius": 10,
+            "perception_px": 900.0,
+            "expose_portal": True,
+            "obs_blocked": False,
+        }
+        assert env._obs_args() == (
+            "--rl-obs-grid=true",
+            "--rl-obs-grid-radius=10",
+            "--rl-perception-px=900.0",
+            "--rl-expose-portal=true",
+            "--rl-obs-blocked=false",
+        )
+    finally:
+        env.close()
 
 
 def test_run_mode_defaults_to_the_run_cap_and_level_1() -> None:
@@ -433,7 +458,7 @@ def test_check_env_passes_on_the_real_environment(live_env: AshCrownEnv) -> None
 @pytest.mark.integration
 def test_live_reset_and_step_shapes(live_env: AshCrownEnv) -> None:
     obs, info = live_env.reset(seed=20260101)
-    assert obs.shape == (3246,)
+    assert obs.shape == (3254,)
     assert obs.dtype == np.float32
     assert live_env.observation_space.contains(obs)
     assert info["episode"] >= 1, "the engine's reset counter is reported on reset"
@@ -448,7 +473,7 @@ def test_live_reset_and_step_shapes(live_env: AshCrownEnv) -> None:
     assert info["episode_steps"] == 1
     assert "episode" not in info, "the reset counter stays out of the step info"
     assert info["episode_seed"] == 20260101
-    assert info["obs_schema"] == "ashcrown-obs-v1"
+    assert info["obs_schema"] == "ashcrown-obs-v2"
 
 
 @pytest.mark.integration
@@ -589,9 +614,77 @@ def test_live_bad_action_does_not_break_the_episode(live_env: AshCrownEnv) -> No
     assert caught.value.bad_action
     obs, _, _, _, info = live_env.step([0, 0, 0])
     assert info["tick"] == 4
-    assert obs.shape == (3246,)
+    assert obs.shape == (3254,)
 
 
 def test_protocol_error_type_is_exported() -> None:
     """Sanity: the env's error handling uses the protocol's exception types."""
     assert issubclass(GodotError, ProtocolError)
+
+
+# --------------------------------------------------------------------------- #
+# RL-6: non-default observation config, end to end
+# --------------------------------------------------------------------------- #
+@pytest.mark.integration
+def test_live_non_default_radius_resets_and_steps(env_kwargs: dict[str, Any]) -> None:
+    """The launch args pre-configure the handshake; a radius-4 episode steps.
+
+    The vector is ``608 + 6*9*9 = 1094`` floats and the Gym space is built from
+    the live handshake, never from a hardcoded length.
+    """
+    env = AshCrownEnv(obs_grid_radius=4, **env_kwargs)
+    try:
+        assert env.obs_len == 1094, "obs_len follows the published radius"
+        assert env.observation_space.shape == (1094,)
+        assert env.layout.grid_radius == 4
+        assert env.layout.grid_size == 9
+        assert env.layout.observation_config["obs_grid_radius"] == 4
+        obs, info = env.reset(seed=20260121)
+        assert obs.shape == (1094,)
+        assert info["observation_config"]["obs_grid_radius"] == 4
+        for _ in range(3):
+            obs, reward, terminated, truncated, info = env.step([2, 0, 0])
+            assert obs.shape == (1094,)
+            assert np.all(np.isfinite(obs))
+            if terminated or truncated:
+                break
+    finally:
+        env.close()
+
+
+@pytest.mark.integration
+def test_live_gridless_observation_resets_and_steps(env_kwargs: dict[str, Any]) -> None:
+    """``obs_grid=false`` is launched up front and drops the grid block."""
+    env = AshCrownEnv(obs_grid=False, **env_kwargs)
+    try:
+        assert env.obs_len == 608
+        assert not env.layout.has_block("grid")
+        assert env.layout.grid_enabled is False
+        obs, info = env.reset(seed=20260122)
+        assert obs.shape == (608,)
+        assert info["observation_config"]["obs_grid"] is False
+        for _ in range(2):
+            obs, reward, terminated, truncated, info = env.step([1, 0, 0])
+            assert obs.shape == (608,)
+            if terminated or truncated:
+                break
+    finally:
+        env.close()
+
+
+@pytest.mark.integration
+def test_live_strict_perception_and_portal_assist(env_kwargs: dict[str, Any]) -> None:
+    """Perception and the portal assist are launch config, published and used."""
+    env = AshCrownEnv(perception_px=300.0, expose_portal=False, **env_kwargs)
+    try:
+        assert env.layout.observation_config["perception_px"] == 300.0
+        assert env.layout.observation_config["expose_portal"] is False
+        obs, info = env.reset(seed=20260123)
+        assert info["observation_config"]["expose_portal"] is False
+        # The portal sub-block is zeroed by the disabled assist.
+        portal_active = env.layout.value(obs, "global", "portal_active")
+        assert portal_active == 0.0
+        obs, reward, terminated, truncated, info = env.step([2, 1, 0])
+        assert env.layout.value(obs, "global", "portal_active") == 0.0
+    finally:
+        env.close()
