@@ -579,7 +579,9 @@ class MetadataCheckpointCallback(BaseCallback):
         self.save_dir.mkdir(parents=True, exist_ok=True)
         target = self.save_dir / f"{self.prefix}_{int(timestep)}_steps.zip"
         self.model.save(str(target))
-        write_metadata(target, self.metadata_builder(int(timestep)))
+        metadata = dict(self.metadata_builder(int(timestep)))
+        metadata["checkpoint"] = target.name
+        write_metadata(target, metadata)
         self.saved.append(target)
         return target
 
