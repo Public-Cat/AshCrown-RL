@@ -285,7 +285,7 @@ from ashcrown_rl.vec import make_vec_env
 envs = make_vec_env(8, seed=20260101, env_kwargs={"level": 1, "frame_skip": 4})
 obs, infos = envs.reset()
 obs, rewards, terminated, truncated, infos = envs.step(actions)  # (8, ...) batches
-envs.close()  # also reaps every child
+envs.close()  # graceful, then reaps every child (also close(terminate=True))
 ```
 
 - `AsyncVectorEnv`, `multiprocessing_context="spawn"`, `shared_memory=False`;
@@ -294,7 +294,12 @@ envs.close()  # also reaps every child
   and each worker draws its episode seeds from that stream so even the
   auto-reset episodes are reproducible;
 - `autoreset_mode=SAME_STEP`: the terminal step returns the reset observation
-  and the real one in `infos["final_obs"]` / `infos["final_info"]`.
+  and the real one in `infos["final_obs"]` / `infos["final_info"]`;
+- `close(terminate: bool = False)` forwards Gymnasium's flag (its `__del__`
+  calls `close(terminate=True)`) and hard-terminates any worker that outlives
+  the graceful close, so a dropped vector env leaves no worker and no Godot
+  process behind; a constructor that raises reaps the workers it already
+  started and closes the parent-side probe env.
 
 ## Tests
 
@@ -331,10 +336,11 @@ are fixed for the life of a process; a reset may not change them. `obs_grid`
 must stay `true` and `obs_grid_radius` must be 10 in RL-2/RL-4.
 
 **Replay diverges** — `python -m ashcrown_rl.replay replay` names the first
-differing step. Check that both runs used the same game build (`layout_hash`)
-and engine flags; the determinism promise is per binary/platform
-(`docs/07` §10.1). A different CPU architecture or a rebuilt engine may change
-the last bits.
+differing step and prints a bounded state diff of that step (the recorded vs
+fresh state line, reduced to the fields that changed). Check that both runs
+used the same game build (`layout_hash`) and engine flags; the determinism
+promise is per binary/platform (`docs/07` §10.1). A different CPU architecture
+or a rebuilt engine may change the last bits.
 
 **Two processes, one machine** — every environment is a full Godot process
 (~450 MB RSS). 8–16 fit on this host; cap `make_vec_env(n_envs)` accordingly
@@ -345,11 +351,16 @@ and always `close()` it.
 ## Status
 
 - **RL-3 (landed)**: protocol client, launcher, benchmark.
-- **RL-4 (this slice)**: `spaces`, `env`, `vec`, `baseline`, `evaluate`,
+- **RL-4 (landed)**: `spaces`, `env`, `vec`, `baseline`, `evaluate`,
   `replay`, examples, tests and this document. Measured on this host:
-  486.7 steps/s for one environment and 2,200 steps/s aggregate for eight
-  (`docs/artifacts/RL/bench.csv`), plus the fixed-seed baseline run in
-  `docs/artifacts/RL/baseline_level1.json` and `RL4-report.md`.
+  **487.7 steps/s** for one environment and **2,370 steps/s** aggregate for
+  eight (`docs/artifacts/RL/bench.csv`). The scripted heuristic **meets the
+  acceptance bar**: it clears level 1 on **8 of the 10 fixed seeds** (warrior,
+  `frame_skip=4`, `max_ticks=18,000`, determinism verified across two repeats)
+  — `docs/artifacts/RL/baseline_level1.json` / `.csv`, with the per-seed story
+  in `RL4-report.md`. On 60 unseen seeds (11–70) the same configuration clears
+  **41/60 (68 %)** — `docs/artifacts/RL/unseen_seeds_11_70.csv` — so the fixed
+  list is the friendlier half of the distribution.
 - **RL-5 / RL-7 (next)**: run mode + merchant policy, then the PPO pipeline.
 
 ## Licence

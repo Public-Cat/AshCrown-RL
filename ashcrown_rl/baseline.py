@@ -40,8 +40,9 @@ clears level 1 on at least 8 of 10 fixed seeds with the warrior inside the
 ``DEFAULT_CONFIG`` (``strafe_dodge=True``, ``strafe_side=+1``,
 ``strike_margin_px=60``, ``dodge_window_s=0.45``, ``strafe_band_px=8``,
 ``standoff_frac=0.92``, ``keepout_slack_px=12``; every pack gate off). Seeds 3
-and 8 are the two failures. On **unseen** seed lists the same config clears 19/30 (seeds 11–40) and 22/30 (seeds 41–70), i.e. 68 %
-overall — the fixed list is the friendlier half of the distribution. See
+and 8 are the two failures. On **unseen** seed lists the same config clears
+19/30 (seeds 11–40) and 22/30 (seeds 41–70), i.e. **41/60 = 68 %** overall — the
+fixed list is the friendlier half of the distribution. See
 ``docs/artifacts/RL/RL4-report.md`` §"round 4" and
 ``docs/artifacts/RL/unseen_seeds.csv`` for the measurements.
 """
