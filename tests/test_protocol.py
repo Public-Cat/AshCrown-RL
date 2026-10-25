@@ -14,6 +14,7 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from ashcrown_rl.protocol import (
     OBS_SCHEMA,
     PROTOCOL,
     AshCrownClient,
+    Frame,
     FrameDecoder,
     GodotError,
     ProtocolError,
@@ -60,6 +62,7 @@ def _hello(*, obs_len: int = 6, layout_hash: str | None = None) -> dict[str, Any
         "action_schema": ACTION_SCHEMA,
         "layout_hash": layout_hash or "a" * 64,
         "obs_len": obs_len,
+        "obs_clamp": [-1.0, 1.0],
         "frame_skip_default": 4,
         "physics_ticks_per_second": 60,
         "character_ids": ["warrior"],
@@ -215,6 +218,32 @@ def test_non_finite_payload_is_rejected() -> None:
         encode_frame(MSG_RESPONSE, {"reward": float("nan")})
 
 
+def test_decoder_stays_dead_after_an_oversized_frame() -> None:
+    decoder = FrameDecoder()
+    with pytest.raises(ProtocolError, match="exceeds"):
+        decoder.feed(struct.pack("<I", MAX_FRAME_BYTES + 1))
+    assert decoder.dead, "a bad frame kills the decoder"
+    assert decoder.error is not None
+    with pytest.raises(ProtocolError, match="dead"):
+        decoder.feed(encode_frame(MSG_REQUEST, {"cmd": "ping"}))
+    with pytest.raises(ProtocolError, match="dead"):
+        decoder.feed(b"")
+
+
+def test_decoder_stays_dead_after_a_malformed_frame() -> None:
+    json_bytes = b"{not json"
+    total = 1 + 4 + len(json_bytes) + 4
+    body = bytes((MSG_REQUEST,)) + struct.pack("<I", len(json_bytes)) + json_bytes
+    body += struct.pack("<I", 0)
+    decoder = FrameDecoder()
+    with pytest.raises(ProtocolError, match="JSON"):
+        decoder.feed(struct.pack("<I", total) + body)
+    assert decoder.dead, "the decoder is dead, matching the engine closing the socket"
+    assert decoder.buffered_bytes == 0, "the corrupt bytes are dropped"
+    with pytest.raises(ProtocolError, match="dead"):
+        decoder.feed(struct.pack("<I", total) + body)
+
+
 # --------------------------------------------------------------------------- #
 # Handshake verification
 # --------------------------------------------------------------------------- #
@@ -242,6 +271,40 @@ def test_verify_handshake_rejects_a_layout_hash_change() -> None:
         verify_handshake(_hello(), compat={}, expected_layout_hash="b" * 64)
 
 
+def test_verify_handshake_uses_the_compat_layout_hash_pin() -> None:
+    verify_handshake(_hello(), compat={"layout_hash": "a" * 64})
+    with pytest.raises(ProtocolMismatch, match="layout_hash"):
+        verify_handshake(_hello(), compat={"layout_hash": "c" * 64})
+    # The explicit argument overrides the pin (evaluation of an older build).
+    verify_handshake(
+        _hello(), compat={"layout_hash": "c" * 64}, expected_layout_hash="a" * 64
+    )
+
+
+def test_verify_handshake_requires_the_documented_clamp() -> None:
+    wide = _hello()
+    wide["obs_clamp"] = [-2.0, 2.0]
+    with pytest.raises(ProtocolMismatch, match="obs_clamp"):
+        verify_handshake(wide, compat={})
+    missing = _hello()
+    del missing["obs_clamp"]
+    with pytest.raises(ProtocolMismatch, match="obs_clamp"):
+        verify_handshake(missing, compat={})
+    with pytest.raises(ProtocolMismatch, match="obs_clamp"):
+        verify_handshake(_hello(), compat={"obs_clamp": [-1.0, 2.0]})
+
+
+def test_verify_handshake_cross_checks_the_layout_obs_len() -> None:
+    hello = _hello()
+    hello["layout"]["obs_len"] = 7
+    with pytest.raises(ProtocolMismatch, match="layout obs_len"):
+        verify_handshake(hello, compat={})
+    blocked = _hello()
+    blocked["layout"]["blocks"][0]["size"] = 0
+    with pytest.raises(ProtocolMismatch, match="size"):
+        verify_handshake(blocked, compat={})
+
+
 def test_verify_handshake_rejects_a_broken_layout_table() -> None:
     hello = _hello()
     hello["obs_len"] = 7
@@ -263,6 +326,9 @@ def test_load_compat_reads_the_submodule_contract() -> None:
     assert contract["protocol"] == PROTOCOL
     assert contract["obs_schema"] == OBS_SCHEMA
     assert contract["action_schema"] == ACTION_SCHEMA
+    layout_hash = contract["layout_hash"]
+    assert isinstance(layout_hash, str) and len(layout_hash) == 64
+    assert contract["obs_clamp"] == [-1.0, 1.0]
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +383,131 @@ def test_client_reports_a_dead_endpoint() -> None:
         client.connect()
 
 
+def test_reset_omits_max_ticks_when_not_given() -> None:
+    """``reset()`` without ``max_ticks`` lets the engine apply its default."""
+    captured: dict[str, Any] = {}
+    client = AshCrownClient(port=1, compat={}, expected_layout_hash="a" * 64)
+    client.hello = _hello()
+
+    def _capture(payload: Mapping[str, Any], expected_cmd: str, **_kwargs: Any) -> Frame:
+        captured.clear()
+        captured.update(payload)
+        return Frame(
+            msg_type=MSG_RESPONSE,
+            payload={"ok": True, "cmd": expected_cmd, "info": {}},
+            binary=np.zeros(6, dtype=np.float32),
+        )
+
+    client._exchange = _capture  # type: ignore[method-assign]
+    client.reset(seed=1)
+    assert "max_ticks" not in captured
+    client.reset(seed=1, max_ticks=600)
+    assert captured["max_ticks"] == 600
+
+
+# --------------------------------------------------------------------------- #
+# Launcher fail-safety (no Godot needed: a fake binary exits immediately)
+# --------------------------------------------------------------------------- #
+def _write_fake_binary(directory: Path, stderr_line: str = "") -> Path:
+    """Stand-in for an exported binary: prints one stderr line and exits 1."""
+    path = directory / "ashcrown.x86_64"
+    lines = ["#!/bin/sh"]
+    if stderr_line:
+        lines.append(f"echo {stderr_line!r} >&2")
+    lines.append("exit 1")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+class _ExitedChild:
+    """Minimal stand-in for an exited engine process."""
+
+    returncode = 1
+
+    def poll(self) -> int:
+        return 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 1
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+def test_start_failure_removes_the_scene_override(tmp_path: Path) -> None:
+    """A failed retry must not leave ``override.cfg`` or a zombie behind."""
+    binary = _write_fake_binary(tmp_path, "path overrides are disabled in this template")
+    process = GodotProcess(
+        LaunchConfig(exported_binary=binary, startup_timeout_sec=30, shutdown_timeout_sec=5)
+    )
+    with pytest.raises(GodotProcessError) as caught:
+        process.start()
+    assert caught.value.returncode == 1, caught.value.stderr_tail
+    assert "path overrides" in caught.value.stderr_tail, "the retry path was exercised"
+    assert not (tmp_path / "override.cfg").exists(), "the written override.cfg was removed"
+    assert process.ready is None
+    assert process._process is None, "the child was killed and reaped"
+    assert process._readers == [], "the reader threads were joined"
+    assert binary.is_file(), "the binary itself is untouched"
+    port_file = Path(process.config.port_file or "")
+    process.close()
+    process.close()
+    assert not port_file.exists(), "close() twice is clean"
+    assert not (tmp_path / "override.cfg").exists()
+
+
+def test_start_ignores_a_stale_port_file(tmp_path: Path) -> None:
+    """A port file from an earlier run must not make a dead process look ready."""
+    binary = _write_fake_binary(tmp_path)
+    port_file = tmp_path / "rl.port"
+    port_file.write_text(
+        json.dumps({"port": 1, "pid": 0, "protocol": PROTOCOL, "obs_schema": OBS_SCHEMA}),
+        encoding="utf-8",
+    )
+    process = GodotProcess(
+        LaunchConfig(exported_binary=binary, port_file=port_file, startup_timeout_sec=30)
+    )
+    try:
+        with pytest.raises(GodotProcessError) as caught:
+            process.start()
+        assert caught.value.returncode == 1
+        assert process.ready is None, "the stale port was not used as a readiness signal"
+        assert not port_file.exists(), "the stale port file is removed before the spawn"
+    finally:
+        process.close()
+
+
+def test_connect_failure_reports_the_stderr_tail() -> None:
+    """A refused session carries the engine log, not just the socket error."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    process = GodotProcess(LaunchConfig())
+    process._process = _ExitedChild()  # type: ignore[assignment]
+    process._ready = {"port": port}
+    process._stderr.append("engine said: schema mismatch")
+    try:
+        with pytest.raises(GodotProcessError) as caught:
+            process.connect()
+        assert "schema mismatch" in caught.value.stderr_tail
+        assert caught.value.returncode == 1
+        assert "RL session" in str(caught.value)
+    finally:
+        process.close()
+
+
+def test_close_without_start_is_a_no_op() -> None:
+    process = GodotProcess(LaunchConfig())
+    process.close()
+    process.close()
+    assert process.override_restore_error == ""
+    assert process.ready is None
+
+
 # --------------------------------------------------------------------------- #
 # Live engine (integration)
 # --------------------------------------------------------------------------- #
@@ -348,6 +539,8 @@ def test_live_handshake_matches_the_compat_contract(live_client: AshCrownClient)
     hello = live_client.hello
     assert hello is not None
     verify_handshake(hello, load_compat())
+    assert hello["layout_hash"] == load_compat()["layout_hash"]
+    assert hello["obs_clamp"] == [-1.0, 1.0]
     assert hello["obs_len"] == 3246
     assert hello["character_ids"] == ["warrior", "knight", "fighter"]
     assert hello["physics_ticks_per_second"] == 60
@@ -369,6 +562,10 @@ def test_live_reset_step_and_ping(live_client: AshCrownClient) -> None:
     assert info["seed"] == 20260101
     assert info["level"] == 1
     assert info["tick"] == 0
+    assert info["episode"] == 1
+    hello = live_client.hello
+    assert hello is not None
+    assert info["layout_hash"] == hello["layout_hash"]
 
     result = live_client.step(0, 0, 0)
     assert result.obs.shape == (3246,)
@@ -377,9 +574,66 @@ def test_live_reset_step_and_ping(live_client: AshCrownClient) -> None:
     assert not result.truncated
     assert result.info["tick"] == 4
     assert result.info["step_ticks"] == 4
+    assert result.info["episode"] == 1
     assert len(result.info["state_hash"]) == 64
 
     assert live_client.ping()["tick"] == 4
+
+
+@pytest.mark.integration
+def test_live_first_reset_after_warmup_accepts_a_custom_config() -> None:
+    """The discarded warm-up must not leak its config into episode 1."""
+    with GodotProcess(_launch_config()) as process:
+        client = process.connect()
+        obs, info = client.reset(seed=20260110, frame_skip=8, max_ticks=600)
+        assert obs.shape == (3246,), "the first client reset is accepted (used to be BAD_CONFIG)"
+        assert info["episode"] == 1
+        result = client.step(0, 0, 0)
+        assert result.info["step_ticks"] == 8, "the requested decision window is used"
+        assert not result.truncated
+
+
+@pytest.mark.integration
+def test_live_first_reset_without_max_ticks_uses_the_level_default() -> None:
+    """A first ``reset`` without ``max_ticks`` must not cap at the 240-tick warm-up."""
+    with GodotProcess(_launch_config()) as process:
+        client = process.connect()
+        client.reset(seed=20260111)
+        result = client.step(0, 0, 0)
+        for _step in range(60):
+            assert not result.truncated, f"truncated at tick {result.info['tick']}"
+            result = client.step(0, 0, 0)
+        assert result.info["tick"] > 240, "the episode runs past the warm-up cap (18,000 default)"
+        assert not result.truncated
+
+
+@pytest.mark.integration
+def test_live_second_connection_is_rejected() -> None:
+    process = GodotProcess(_launch_config())
+    try:
+        client = process.connect()
+        client.reset(seed=20260112, max_ticks=60)
+        assert process.ready is not None
+        port = int(process.ready["port"])
+        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        second.settimeout(5.0)
+        try:
+            try:
+                second.connect((process.config.host, port))
+            except OSError:
+                pass  # refused: the listener is closed after the first accept
+            else:
+                # A connection queued in the closing backlog is dropped, so the
+                # peer sees an immediate close/reset instead of a hang.
+                try:
+                    assert second.recv(4096) == b""
+                except OSError:
+                    pass
+        finally:
+            second.close()
+        assert client.ping()["ok"] is True, "the first client is unaffected"
+    finally:
+        process.close()
 
 
 @pytest.mark.integration

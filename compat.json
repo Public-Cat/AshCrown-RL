@@ -2,7 +2,9 @@
   "protocol": 1,
   "obs_schema": "ashcrown-obs-v1",
   "action_schema": "ashcrown-act-v1",
+  "layout_hash": "fc8c0f26ccca4d8eef3ccbc8faa19cb2f78e27b5159913ef252648dc414ece1a",
+  "obs_clamp": [-1.0, 1.0],
   "game_repo": "git@github.com:Public-Cat/AshCrown.git",
   "game_min_commit": "7d0ad23",
-  "notes": "game_min_commit is the game commit that landed the RL-3 bridge (TCP transport, protocol server mode, tools/rl). The client must still verify the live handshake and layout_hash; this file is documentation, not a substitute for the handshake."
+  "notes": "game_min_commit is the game commit that landed the RL-3 bridge (TCP transport, protocol server mode, tools/rl). layout_hash pins the ashcrown-obs-v1 layout table (RLSchema.layout()); verify_handshake compares the live handshake against it unless an explicit expected_layout_hash override is passed. obs_clamp is the documented observation range. This file documents the target; the live handshake remains the compatibility authority."
 }

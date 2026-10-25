@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .protocol import DEFAULT_TIMEOUT, OBS_SCHEMA, PROTOCOL, AshCrownClient
+from .protocol import DEFAULT_TIMEOUT, OBS_SCHEMA, PROTOCOL, AshCrownClient, ProtocolError
 
 #: Scene the RL environment lives in (packed into exports too).
 RL_SCENE = "res://scenes/rl/rl_env.tscn"
@@ -205,10 +205,16 @@ class GodotProcess:
         self._temporary_port_file: Path | None = None
         self._override_file: Path | None = None
         self._override_backup: bytes | None = None
+        self._override_restore_error: str = ""
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> GodotProcess:
-        """Spawn the engine and wait until it is listening."""
+        """Spawn the engine and wait until it is listening.
+
+        Fail-safe: any failure after the first spawn restores ``override.cfg``
+        and kills/reaps the child (and its reader threads) before re-raising,
+        so a retry never inherits a half-started process or a stray override.
+        """
         if self._process is not None:
             return self
         if self.config.port_file is None:
@@ -217,19 +223,34 @@ class GodotProcess:
             os.unlink(path)  # the server creates it atomically; never reuse a stale file
             self._temporary_port_file = Path(path)
             self.config = dataclasses.replace(self.config, port_file=self._temporary_port_file)
+        else:
+            # A caller-supplied path may still hold the port of an older run;
+            # reading it would make a dead process look ready.
+            Path(self.config.port_file).unlink(missing_ok=True)
         self._spawn(use_scene_override=False)
         try:
-            self._ready = self._wait_ready()
-        except GodotProcessError as exc:
-            if not self._can_retry_with_scene_override(exc):
-                raise
-            self._write_scene_override()
-            self._spawn(use_scene_override=True)
-            self._ready = self._wait_ready()
+            try:
+                self._ready = self._wait_ready()
+            except GodotProcessError as exc:
+                if not self._can_retry_with_scene_override(exc):
+                    raise
+                self._write_scene_override()
+                self._spawn(use_scene_override=True)
+                self._ready = self._wait_ready()
+        except BaseException:
+            self._restore_scene_override()
+            self._kill_and_reap(graceful=False)
+            raise
         return self
 
     def connect(self, timeout: float | None = None) -> AshCrownClient:
-        """Start if needed and return a connected, handshake-verified client."""
+        """Start if needed and return a connected, handshake-verified client.
+
+        A connect/handshake failure is reported as :class:`GodotProcessError`
+        carrying the captured stderr tail: the interesting cause (a refused
+        port, a dying engine, a schema mismatch) is almost always in the
+        engine log, not in the socket error.
+        """
         self.start()
         if self._client is not None:
             return self._client
@@ -239,33 +260,31 @@ class GodotProcess:
             port=int(self._ready["port"]),
             timeout=self.config.timeout_sec,
         )
-        client.connect(timeout)
+        try:
+            client.connect(timeout)
+        except (ProtocolError, OSError) as exc:
+            client.close()
+            raise GodotProcessError(
+                f"could not open the RL session: {exc}",
+                returncode=self.returncode,
+                stderr_tail=self.stderr_tail,
+                command=self.command,
+            ) from exc
         self._client = client
         return client
 
     def close(self) -> None:
-        """Close the protocol session, reap the process, remove the port file."""
+        """Close the protocol session, reap the process, remove the port file.
+
+        Idempotent: safe when nothing was started, after a failed ``start()``
+        and when called twice.
+        """
         if self._client is not None:
             try:
                 self._client.close()
             finally:
                 self._client = None
-        process = self._process
-        if process is not None:
-            try:
-                process.wait(timeout=self.config.shutdown_timeout_sec)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            finally:
-                self._process = None
-        for reader in self._readers:
-            reader.join(timeout=1)
-        self._readers.clear()
+        self._kill_and_reap()
         self._restore_scene_override()
         port_file = self.config.port_file
         if port_file is not None:
@@ -278,19 +297,32 @@ class GodotProcess:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    @property
+    def override_restore_error(self) -> str:
+        """Why the last ``override.cfg`` restore failed, or ``""``."""
+        return self._override_restore_error
+
     def _restore_scene_override(self) -> None:
-        """Undo :meth:`_write_scene_override` (remove the file or restore it)."""
+        """Undo :meth:`_write_scene_override` (remove the file or restore it).
+
+        Idempotent and safe when no override was written: the recorded path and
+        backup are cleared before the filesystem is touched. A filesystem error
+        is recorded in :attr:`override_restore_error` instead of raising, so a
+        cleanup never hides the error that triggered it.
+        """
         path = self._override_file
+        backup = self._override_backup
+        self._override_file = None
+        self._override_backup = None
         if path is None:
             return
         try:
-            if self._override_backup is None:
+            if backup is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_bytes(self._override_backup)
-        finally:
-            self._override_file = None
-            self._override_backup = None
+                path.write_bytes(backup)
+        except OSError as exc:
+            self._override_restore_error = f"{path}: {exc}"
 
     # -- introspection ------------------------------------------------------ #
     @property
@@ -320,6 +352,42 @@ class GodotProcess:
         return self._process.wait(timeout=timeout)
 
     # -- internals ---------------------------------------------------------- #
+    def _kill_and_reap(self, *, graceful: bool = True) -> None:
+        """Stop the child (if any) and join its reader threads.
+
+        ``graceful`` waits for the child to exit on its own (the ``close``
+        path, after the protocol ``close`` command); otherwise it terminates
+        immediately (the fail-safe path of :meth:`start`, where the child is
+        known to be unusable). Leaves no zombie behind and is safe to call
+        when nothing was spawned.
+        """
+        process = self._process
+        self._process = None
+        if process is not None:
+            if graceful:
+                try:
+                    process.wait(timeout=self.config.shutdown_timeout_sec)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        self._drain_readers()
+
+    def _drain_readers(self, timeout: float = 1.0) -> None:
+        """Join the stdout/stderr pumps so their tails are complete.
+
+        The readers end when the pipes close (the child exited), so this makes
+        an error report deterministic instead of racing the pumps.
+        """
+        for reader in self._readers:
+            reader.join(timeout=timeout)
+        self._readers = []
+
     def _spawn(self, *, use_scene_override: bool) -> None:
         """Start the engine process with the resolved argv."""
         self._process = None
@@ -355,16 +423,19 @@ class GodotProcess:
 
         The file lives next to the exported binary (Godot only reads
         ``override.cfg`` from the project directory). An existing file is
-        backed up and restored by :meth:`close`.
+        backed up and restored by :meth:`close` or by the fail-safe path of
+        :meth:`start`. The path is recorded **before** the write so even a
+        partially written file is cleaned up.
         """
         binary = Path(self.config.exported_binary or "")
         path = binary.expanduser().resolve().parent / "override.cfg"
+        self._override_file = path
+        self._override_backup = None
         try:
             self._override_backup = path.read_bytes()
         except FileNotFoundError:
             self._override_backup = None
         path.write_text(f'[application]\nrun/main_scene="{self.config.scene}"\n', encoding="utf-8")
-        self._override_file = path
 
     def _start_readers(self) -> None:
         process = self._process
@@ -392,6 +463,9 @@ class GodotProcess:
         while time.monotonic() < deadline:
             process = self._process
             if process is not None and process.poll() is not None:
+                # Reap the pumps first: the exit reason lives on stderr and the
+                # scene-override retry keys off that tail.
+                self._drain_readers()
                 raise GodotProcessError(
                     "godot exited before becoming ready",
                     returncode=process.returncode,

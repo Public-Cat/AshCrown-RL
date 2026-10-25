@@ -161,32 +161,53 @@ class FrameDecoder:
     """Incremental frame decoder (partial reads and coalesced frames).
 
     Feed arbitrary chunks; every completed frame is returned. A malformed or
-    oversized frame raises :class:`ProtocolError` and leaves the decoder empty
-    (the connection must be closed, like the engine side).
+    oversized frame raises :class:`ProtocolError` **and kills the decoder**:
+    the byte stream can no longer be trusted, so every later read raises too
+    (the engine closes the connection for the same reason, ``docs/07`` §8.1).
     """
 
     def __init__(self) -> None:
         self._buffer = bytearray()
+        self._error: str | None = None
 
     def feed(self, data: bytes) -> list[Frame]:
+        if self._error is not None:
+            raise ProtocolError(
+                f"the decoder is dead after '{self._error}'; the stream is no longer trustworthy"
+            )
         self._buffer.extend(data)
         frames: list[Frame] = []
-        while len(self._buffer) >= _PREFIX.size:
-            (total_len,) = _PREFIX.unpack_from(self._buffer)
-            if total_len > MAX_FRAME_BYTES:
-                self._buffer.clear()
-                raise ProtocolError(
-                    f"frame of {total_len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"
-                )
-            if total_len < MIN_TOTAL_LEN:
-                self._buffer.clear()
-                raise ProtocolError(f"frame length {total_len} is below the minimum")
-            if len(self._buffer) < _PREFIX.size + total_len:
-                break
-            body = bytes(self._buffer[_PREFIX.size : _PREFIX.size + total_len])
-            del self._buffer[: _PREFIX.size + total_len]
-            frames.append(_parse_body(body))
+        try:
+            while len(self._buffer) >= _PREFIX.size:
+                (total_len,) = _PREFIX.unpack_from(self._buffer)
+                if total_len > MAX_FRAME_BYTES:
+                    raise ProtocolError(
+                        f"frame of {total_len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"
+                    )
+                if total_len < MIN_TOTAL_LEN:
+                    raise ProtocolError(f"frame length {total_len} is below the minimum")
+                if len(self._buffer) < _PREFIX.size + total_len:
+                    break
+                body = bytes(self._buffer[_PREFIX.size : _PREFIX.size + total_len])
+                del self._buffer[: _PREFIX.size + total_len]
+                frames.append(_parse_body(body))
+        except ProtocolError as exc:
+            # Dead decoder: drop the garbage so no later read can resynchronise
+            # on a frame boundary inside a corrupt stream.
+            self._error = str(exc)
+            self._buffer.clear()
+            raise
         return frames
+
+    @property
+    def dead(self) -> bool:
+        """True once a bad frame made every further read fail."""
+        return self._error is not None
+
+    @property
+    def error(self) -> str | None:
+        """Why the decoder died (``None`` while healthy)."""
+        return self._error
 
     @property
     def buffered_bytes(self) -> int:
@@ -250,6 +271,11 @@ def verify_handshake(
     Raises :class:`ProtocolMismatch` on any difference and :class:`ProtocolError`
     when the payload is not a handshake at all. ``compat=None`` loads
     ``compat.json``; pass ``{}`` to skip the version checks (evaluation only).
+
+    ``layout_hash`` is pinned by ``compat.json`` unless ``expected_layout_hash``
+    overrides it explicitly (e.g. to evaluate an intentionally older build).
+    The layout block table is cross-checked against ``obs_len`` and the
+    published observation clamp must be ``[-1, 1]``.
     """
     if not isinstance(hello, Mapping):
         raise ProtocolError("handshake is not a JSON object")
@@ -275,9 +301,18 @@ def verify_handshake(
     layout_hash = hello.get("layout_hash")
     if not isinstance(layout_hash, str) or len(layout_hash) != 64:
         raise ProtocolMismatch(f"handshake layout_hash={layout_hash!r} is not a SHA-256 hex")
-    if expected_layout_hash is not None and layout_hash != expected_layout_hash:
+    pinned_hash = expected_layout_hash
+    if pinned_hash is None:
+        contract_hash = contract.get("layout_hash")
+        pinned_hash = contract_hash if isinstance(contract_hash, str) else None
+    if pinned_hash is not None and layout_hash != pinned_hash:
         raise ProtocolMismatch(
-            f"handshake layout_hash={layout_hash} but {expected_layout_hash} is required"
+            f"handshake layout_hash={layout_hash} but {pinned_hash} is required"
+        )
+    clamp = _verify_clamp(hello.get("obs_clamp"))
+    if "obs_clamp" in contract and list(contract["obs_clamp"]) != list(clamp):
+        raise ProtocolMismatch(
+            f"handshake obs_clamp={list(clamp)} but compat.json pins {contract['obs_clamp']}"
         )
     obs_len = hello.get("obs_len")
     if not isinstance(obs_len, int) or obs_len <= 0:
@@ -285,6 +320,10 @@ def verify_handshake(
     layout = hello.get("layout")
     if not isinstance(layout, Mapping) or not isinstance(layout.get("blocks"), list):
         raise ProtocolMismatch("handshake carries no layout block table")
+    if layout.get("obs_len") is not None and layout["obs_len"] != obs_len:
+        raise ProtocolMismatch(
+            f"layout obs_len={layout['obs_len']!r} does not match the handshake's {obs_len}"
+        )
     offset = 0
     for block in layout["blocks"]:
         if not isinstance(block, Mapping):
@@ -294,13 +333,29 @@ def verify_handshake(
                 f"layout block {block.get('name')!r} starts at {block.get('offset')!r}, "
                 f"expected {offset}"
             )
-        offset += int(block.get("size", 0))
+        size = block.get("size")
+        if not isinstance(size, int) or size <= 0:
+            raise ProtocolMismatch(f"layout block {block.get('name')!r} has size {size!r}")
+        offset += size
     if offset != obs_len:
         raise ProtocolMismatch(f"layout blocks cover {offset} floats but obs_len is {obs_len}")
     for key in ("frame_skip_default", "physics_ticks_per_second"):
         value = hello.get(key)
         if not isinstance(value, int) or value <= 0:
             raise ProtocolMismatch(f"handshake {key}={value!r} is not a positive integer")
+
+
+def _verify_clamp(value: Any) -> tuple[float, float]:
+    """The published ``[-1, 1]`` observation clamp, or :class:`ProtocolMismatch`."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ProtocolMismatch(f"handshake obs_clamp={value!r} is not a [min, max] pair")
+    try:
+        low, high = float(value[0]), float(value[1])
+    except (TypeError, ValueError) as exc:
+        raise ProtocolMismatch(f"handshake obs_clamp={value!r} is not numeric") from exc
+    if (low, high) != (-1.0, 1.0):
+        raise ProtocolMismatch(f"handshake obs_clamp=[{low}, {high}] is not the documented [-1, 1]")
+    return low, high
 
 
 # --------------------------------------------------------------------------- #
@@ -391,7 +446,7 @@ class AshCrownClient:
         level: int = 1,
         character: str = DEFAULT_CHARACTER,
         frame_skip: int | None = None,
-        max_ticks: int = DEFAULT_MAX_TICKS,
+        max_ticks: int | None = None,
         obs_grid: bool = True,
         obs_grid_radius: int = DEFAULT_OBS_GRID_RADIUS,
         reward_profile: str = DEFAULT_REWARD_PROFILE,
@@ -402,7 +457,9 @@ class AshCrownClient:
         """Start a new episode and return ``(obs, info)``.
 
         ``seed=None`` lets the engine draw one (it is returned in ``info``).
-        ``frame_skip=None`` uses the handshake's ``frame_skip_default``.
+        ``frame_skip=None`` uses the handshake's ``frame_skip_default``;
+        ``max_ticks=None`` omits the field so the engine applies its level
+        default (18,000 ticks, ``docs/07`` §4.2).
         """
         if frame_skip is None:
             frame_skip = int(self._hello()["frame_skip_default"])
@@ -412,7 +469,6 @@ class AshCrownClient:
             "level": int(level),
             "character": character,
             "frame_skip": int(frame_skip),
-            "max_ticks": int(max_ticks),
             "obs_grid": bool(obs_grid),
             "obs_grid_radius": int(obs_grid_radius),
             "reward_profile": reward_profile,
@@ -421,6 +477,8 @@ class AshCrownClient:
         }
         if seed is not None:
             payload["seed"] = int(seed)
+        if max_ticks is not None:
+            payload["max_ticks"] = int(max_ticks)
         if merchant_policy is not None:
             payload["merchant_policy"] = merchant_policy
         reply = self._exchange(payload, expected_cmd="reset", expect_observation=True)
