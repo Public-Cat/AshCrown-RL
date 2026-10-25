@@ -228,6 +228,7 @@ def record(
             "max_ticks": env.max_ticks,
             "reward_profile": env.reward_profile,
             "reward_overrides": dict(env.reward_overrides),
+            "merchant_policy": env.merchant_policy,
             "hash_every_ticks": env.hash_every_ticks,
         },
         "seed": int(seed),
@@ -265,6 +266,7 @@ def replay(env: AshCrownEnv | None, log: Mapping[str, Any]) -> dict[str, Any]:
         max_ticks=int(config.get("max_ticks", 18_000)),
         reward_profile=str(config.get("reward_profile", "combat")),
         reward_overrides=config.get("reward_overrides") or {},
+        merchant_policy=config.get("merchant_policy"),
         hash_every_ticks=int(config.get("hash_every_ticks", 60)),
     )
     try:
@@ -323,6 +325,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     recorder.add_argument("--frame-skip", type=int, default=4)
     recorder.add_argument("--max-ticks", type=int, default=18_000)
     recorder.add_argument("--policy", default="heuristic", help="heuristic | random | zero")
+    recorder.add_argument("--mode", default="level", help="level | run (RL-5)")
+    recorder.add_argument(
+        "--merchant-policy", default=None, help="engine merchant sub-policy (none | auto_heal)"
+    )
     recorder.add_argument("--game-project", default=None)
     recorder.add_argument("--godot-bin", default=None)
     recorder.add_argument("--out", required=True, help="replay log to write")
@@ -339,10 +345,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "record":
             env = AshCrownEnv(
+                mode=args.mode,
                 level=args.level,
                 character=args.character,
                 frame_skip=args.frame_skip,
                 max_ticks=args.max_ticks,
+                merchant_policy=args.merchant_policy,
                 godot_bin=args.godot_bin,
                 project=args.game_project,
             )
@@ -384,6 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_ticks=int(config.get("max_ticks", 18_000)),
             reward_profile=str(config.get("reward_profile", "combat")),
             reward_overrides=config.get("reward_overrides") or {},
+            merchant_policy=config.get("merchant_policy"),
             hash_every_ticks=int(config.get("hash_every_ticks", 60)),
             godot_bin=args.godot_bin,
             project=args.game_project,

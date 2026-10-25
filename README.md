@@ -91,13 +91,70 @@ parent of `training/`) and the binary (`ASHCROWN_GODOT`, `GODOT_BIN`, then
 | auto-reset | **never** — call `reset()`; the vector wrapper auto-resets |
 | `close()` | sends `close`, reaps the process, idempotent |
 
-`render_mode` is `None` (headless only in v1), `mode` is `level` (run mode is
-RL-5), and the local terrain grid is fixed on at radius 10 (RL-2 constraint).
+`render_mode` is `None` (headless only in v1) and the local terrain grid is
+fixed on at radius 10 (RL-2 constraint).
 
 Determinism (`docs/07` §10): the same seed + the same action sequence produce
-the same `info["state_hash"]` sequence across processes. The engine runs one
-discarded warm-up episode before serving, and every launch uses
+the same `info["state_hash"]` sequence across processes — including across
+descends, so a run-mode log can be recorded and replayed end to end. The engine
+runs one discarded warm-up episode before serving, and every launch uses
 `--headless --fixed-fps 60 --disable-vsync`.
+
+### Run mode and the merchant sub-policy (RL-5)
+
+`mode="level"` (default) is one floor: the portal is terminal
+(`terminal_reason="level_clear"`). `mode="run"` plays the whole ten-level
+descent in one episode (`docs/07` §4.1):
+
+```python
+env = AshCrownEnv(mode="run", merchant_policy="auto_heal", frame_skip=4)
+obs, info = env.reset(seed=20260101)   # level 1, auto_descend on
+while not env.episode_done:
+    obs, reward, terminated, truncated, info = env.step(policy(obs, info, env.layout))
+    info["level"]           # 1..10, follows the descent
+    info["gold"]            # carried across floors (same RunState)
+print(info["terminal_reason"])  # "victory" | "death" | "run_died" | "truncated"
+env.close()
+```
+
+- **Start / cap:** level 1, `max_ticks` defaults to **144,000** (40 game-minutes)
+  instead of 18,000; `level` is ignored in run mode (a run always starts at 1).
+- **Descends:** entering a cleared floor's portal builds the next level and the
+  episode continues; the engine re-acquires the new floor, so `info["level"]`
+  and the observation's `level` feature follow it. Gold, gems, kills and the
+  seed live on `RunState` and are **preserved** across floors; each floor has a
+  fresh `visited` plane.
+- **Terminals:** victory = the level-10 demonlord death (`Events.run_ended`),
+  death = `Events.player_died` (terminated immediately, no summary screen), and
+  `run_ended(false)` = `"run_died"`. A portal is never terminal in run mode;
+  `max_ticks` truncates and a terminal on the same tick wins.
+- **Merchant:** the economy is **not** in the action space (RL-6 owns the
+  observation, RL-5 owns this decision). `merchant_policy` is `"none"`
+  (default: no interaction) or `"auto_heal"`: when the player is inside the
+  merchant's interaction range, hurt and can afford the 40-gold full heal, the
+  engine buys it once per shop/floor visit. `info["events"]["merchant_bought"]`
+  and `info["reward_components"]` (via the ordinary heal/spent-gold rules)
+  record it, and `info["merchant_policy"]` echoes the active policy.
+- **Unknown values** (`mode`, `merchant_policy`) are a `BAD_CONFIG` at reset —
+  the handshake publishes the accepted tables as `modes` / `merchant_policies`.
+
+```bash
+# honest long rollout of the heuristic through a real run (levels reached,
+# terminal, summed reward components, throughput)
+uv run python scripts/run_mode_smoke.py --decisions 30000 --seed 1 \
+    --json /tmp/run_mode.json
+
+# record and replay a run-mode episode that crosses a descend
+uv run python -m ashcrown_rl.replay record --mode run --steps 1200 \
+    --merchant-policy auto_heal --out /tmp/run.json
+uv run python -m ashcrown_rl.replay replay --file /tmp/run.json
+```
+
+Measured on seeds 1–5 (`docs/artifacts/RL/run_mode_heuristic.csv`): the
+heuristic clears level 1 on 4/5 seeds and reaches level 3 on seeds 2 and 5
+(~250–275 decisions/s); seed 3 is its known level-1 stall. The GUT scripted
+clear harness (`tests/integration/test_rl_run_mode.gd`) drives the *real*
+environment from level 1 to the **victory** terminal on seed 20260101.
 
 ## Observation, action and reward reference
 
@@ -361,7 +418,11 @@ and always `close()` it.
   in `RL4-report.md`. On 60 unseen seeds (11–70) the same configuration clears
   **41/60 (68 %)** — `docs/artifacts/RL/unseen_seeds_11_70.csv` — so the fixed
   list is the friendlier half of the distribution.
-- **RL-5 / RL-7 (next)**: run mode + merchant policy, then the PPO pipeline.
+- **RL-5 (landed)**: run mode (ten-level descent, per-floor re-acquisition,
+  victory/death terminals), the `auto_heal` merchant sub-policy, the Python
+  `mode="run"` option, the run-mode smoke script and the GUT scripted clear
+  harness. See the game repository's `docs/artifacts/RL/RL5-report.md`.
+- **RL-6 / RL-7 (next)**: observation v2, then the PPO pipeline.
 
 ## Licence
 

@@ -12,7 +12,7 @@ contract.
 """
 
 from .baseline import DEFAULT_CONFIG as HEURISTIC_CONFIG
-from .baseline import HeuristicConfig, heuristic_action
+from .baseline import HeuristicConfig, HeuristicPolicy, heuristic_action
 from .env import AshCrownEnv
 from .protocol import (
     AshCrownClient,
@@ -34,6 +34,7 @@ __all__ = [
     "AshCrownVectorEnv",
     "GodotError",
     "HeuristicConfig",
+    "HeuristicPolicy",
     "Layout",
     "LayoutError",
     "ProtocolError",

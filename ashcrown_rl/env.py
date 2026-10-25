@@ -25,6 +25,8 @@ Contract (``docs/07`` §9.2):
 * :meth:`reset` accepts ``options`` overriding ``level``, ``character``,
   ``max_ticks``, ``reward_profile``, ``reward_overrides`` and
   ``merchant_policy``;
+* ``mode`` is ``"level"`` (one floor, portal terminal) or ``"run"`` (the full
+  ten-level descent, ``max_ticks`` default 144,000, `docs/07` §4.1);
 * :meth:`step` **never auto-resets** (the engine rejects a step after a
   terminal with ``EPISODE_DONE``; the vector wrapper auto-resets instead);
 * :meth:`close` is idempotent and leaves no process behind.
@@ -51,8 +53,15 @@ from .spaces import Layout, LayoutError
 #: Default episode cap in physics ticks: 5 game-minutes for one level
 #: (``docs/07`` §4.2 / Appendix C).
 DEFAULT_LEVEL_MAX_TICKS = 18_000
-#: Default episode cap for a full run (40 game-minutes; run mode lands in RL-5).
+#: Default episode cap for a full run: 40 game-minutes (``docs/07`` §4.2).
 DEFAULT_RUN_MAX_TICKS = 144_000
+#: Episode modes the engine implements (``docs/07`` §4.1). ``run`` descends
+#: level 1 -> 10 in one episode; ``combat`` stays reserved.
+MODES: tuple[str, ...] = ("level", "run")
+#: Merchant sub-policies the engine implements (``docs/07`` §7.3). The economy
+#: stays out of the action space: ``auto_heal`` buys the full heal whenever the
+#: player is in range, hurt and able to pay.
+MERCHANT_POLICIES: tuple[str, ...] = ("none", "auto_heal")
 #: Reset options ``docs/07`` §9.2 allows the caller to override.
 RESET_OPTIONS: frozenset[str] = frozenset(
     {"level", "character", "max_ticks", "reward_profile", "reward_overrides", "merchant_policy"}
@@ -95,11 +104,8 @@ class AshCrownEnv(gym.Env):
         """
         if render_mode is not None:
             raise ValueError("render_mode=None only: RL-4 has no renderer (docs/07 §9.2)")
-        if mode != "level":
-            raise ValueError(
-                f"mode={mode!r} is not implemented: RL-4 is level mode only "
-                "(run mode lands in RL-5)"
-            )
+        if mode not in MODES:
+            raise ValueError(f"mode={mode!r} is not implemented: choose one of {MODES}")
         if not 1 <= int(frame_skip) <= 64:
             raise ValueError(f"frame_skip={frame_skip!r} must be inside 1..64")
         if not obs_grid:
@@ -110,6 +116,11 @@ class AshCrownEnv(gym.Env):
             raise ValueError(f"level={level!r} must be inside 1..10")
         if max_ticks is not None and not 1 <= int(max_ticks) <= 1_000_000:
             raise ValueError(f"max_ticks={max_ticks!r} must be inside 1..1,000,000")
+        if merchant_policy is not None and merchant_policy not in MERCHANT_POLICIES:
+            raise ValueError(
+                f"merchant_policy={merchant_policy!r} is not implemented: "
+                f"choose one of {MERCHANT_POLICIES}"
+            )
 
         self.mode = str(mode)
         self.level = int(level)
@@ -119,7 +130,14 @@ class AshCrownEnv(gym.Env):
         self.obs_grid_radius = int(obs_grid_radius)
         self.reward_profile = str(reward_profile)
         self.reward_overrides = dict(reward_overrides or {})
-        self.max_ticks = int(DEFAULT_LEVEL_MAX_TICKS if max_ticks is None else max_ticks)
+        # The cap default follows the mode (``docs/07`` §4.2): 5 game-minutes for
+        # one level, 40 for a full run. An explicit ``max_ticks`` wins.
+        if max_ticks is None:
+            self.max_ticks = int(
+                DEFAULT_RUN_MAX_TICKS if self.mode == "run" else DEFAULT_LEVEL_MAX_TICKS
+            )
+        else:
+            self.max_ticks = int(max_ticks)
         self.merchant_policy = merchant_policy
         self.hash_every_ticks = int(hash_every_ticks)
         self.render_mode = render_mode
@@ -222,6 +240,15 @@ class AshCrownEnv(gym.Env):
         profiles = (self.hello.get("reward_profile_defaults") or {}).get("profiles") or {}
         if profiles and self.reward_profile not in profiles:
             raise ValueError(f"reward_profile={self.reward_profile!r} is not in {sorted(profiles)}")
+        modes = self.hello.get("modes")
+        if modes and self.mode not in modes:
+            raise ValueError(f"mode={self.mode!r} is not in the engine's modes {modes}")
+        policies = self.hello.get("merchant_policies")
+        if policies and self.merchant_policy is not None and self.merchant_policy not in policies:
+            raise ValueError(
+                f"merchant_policy={self.merchant_policy!r} is not in the engine's "
+                f"policies {policies}"
+            )
         radius = self._layout.grid_radius
         if radius and self.obs_grid_radius != radius:
             raise ValueError(
@@ -263,11 +290,21 @@ class AshCrownEnv(gym.Env):
         level = int(overrides.get("level", self.level))
         if not 1 <= level <= 10:
             raise ValueError(f"level={level!r} must be inside 1..10")
+        if self.mode == "run":
+            # A run always starts the descent at level 1 (``docs/07`` §4.1); the
+            # engine ignores any other level, the client mirrors it so the request
+            # states what really happens.
+            level = 1
         character = str(overrides.get("character", self.character))
         max_ticks = int(overrides.get("max_ticks", self.max_ticks))
         reward_profile = str(overrides.get("reward_profile", self.reward_profile))
         reward_overrides = overrides.get("reward_overrides", self.reward_overrides)
         merchant_policy = overrides.get("merchant_policy", self.merchant_policy)
+        if merchant_policy is not None and str(merchant_policy) not in MERCHANT_POLICIES:
+            raise ValueError(
+                f"merchant_policy={merchant_policy!r} is not implemented: "
+                f"choose one of {MERCHANT_POLICIES}"
+            )
 
         engine_seed = self._resolve_seed(seed)
         obs, info = self._client.reset(
@@ -462,6 +499,8 @@ def make_env(**kwargs: Any) -> Callable[[], AshCrownEnv]:
 __all__ = [
     "DEFAULT_LEVEL_MAX_TICKS",
     "DEFAULT_RUN_MAX_TICKS",
+    "MERCHANT_POLICIES",
+    "MODES",
     "RESET_OPTIONS",
     "AshCrownEnv",
     "GodotUnavailable",

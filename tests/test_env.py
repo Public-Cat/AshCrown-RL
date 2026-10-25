@@ -18,6 +18,9 @@ from gymnasium.utils.env_checker import check_env
 
 from ashcrown_rl.env import (
     DEFAULT_LEVEL_MAX_TICKS,
+    DEFAULT_RUN_MAX_TICKS,
+    MERCHANT_POLICIES,
+    MODES,
     RESET_OPTIONS,
     AshCrownEnv,
 )
@@ -332,8 +335,10 @@ def test_close_is_idempotent_and_blocks_later_use() -> None:
 
 
 def test_config_validation() -> None:
-    with pytest.raises(ValueError, match="run mode"):
-        AshCrownEnv(mode="run", client_factory=StubClient)
+    with pytest.raises(ValueError, match="mode"):
+        AshCrownEnv(mode="combat", client_factory=StubClient)
+    with pytest.raises(ValueError, match="merchant_policy"):
+        AshCrownEnv(mode="run", merchant_policy="buy_all", client_factory=StubClient)
     with pytest.raises(ValueError, match="obs_grid"):
         AshCrownEnv(obs_grid=False, client_factory=StubClient)
     with pytest.raises(ValueError, match="frame_skip"):
@@ -348,6 +353,39 @@ def test_config_validation() -> None:
         AshCrownEnv(reward_profile="imaginary", client_factory=StubClient)
     with pytest.raises(ValueError, match="obs_grid_radius"):
         AshCrownEnv(obs_grid_radius=4, client_factory=StubClient)
+
+
+def test_run_mode_defaults_to_the_run_cap_and_level_1() -> None:
+    """``docs/07`` §4.1/§4.2: run mode starts level 1 with a 144,000-tick cap."""
+    env, client = make_stub_env(mode="run", level=5)
+    try:
+        assert MODES == ("level", "run")
+        assert MERCHANT_POLICIES == ("none", "auto_heal")
+        assert env.mode == "run"
+        assert env.max_ticks == DEFAULT_RUN_MAX_TICKS
+        obs, info = env.reset(seed=20260101)
+        assert env.observation_space.contains(obs)
+        call = client.reset_calls[-1]
+        assert call["mode"] == "run"
+        assert call["level"] == 1, "a run always starts at level 1"
+        assert call["max_ticks"] == DEFAULT_RUN_MAX_TICKS
+        assert call["merchant_policy"] is None, "the engine default policy passes through"
+        assert info["mode"] == "run"
+    finally:
+        env.close()
+
+
+def test_run_mode_forwards_the_merchant_policy() -> None:
+    env, client = make_stub_env(mode="run", merchant_policy="auto_heal")
+    try:
+        env.reset(seed=3)
+        assert client.reset_calls[-1]["merchant_policy"] == "auto_heal"
+        env.reset(seed=3, options={"merchant_policy": "none"})
+        assert client.reset_calls[-1]["merchant_policy"] == "none"
+        with pytest.raises(ValueError, match="merchant_policy"):
+            env.reset(seed=3, options={"merchant_policy": "buy_all"})
+    finally:
+        env.close()
 
 
 def test_engine_errors_propagate() -> None:
@@ -444,6 +482,54 @@ def test_live_level_episode_terminates_or_truncates(env_kwargs: dict[str, Any]) 
         assert truncated and not terminated
         assert info["terminal_reason"] in ("", "truncated")
         assert info["tick"] == 120
+    finally:
+        env.close()
+
+
+@pytest.mark.integration
+def test_live_run_mode_reports_level_progression_metadata(env_kwargs: dict[str, Any]) -> None:
+    """A short run-mode episode over the TCP bridge (``docs/07`` §4.1, §7.3).
+
+    The full ten-level descent is exercised by the GDScript scripted clear
+    harness (``tests/integration/test_rl_run_mode.gd``); this test pins the
+    contract the Python client depends on: the mode is accepted and validated,
+    the cap defaults to 144,000 ticks, the layout is unchanged and every step
+    reports the live level as both an `info` field and the observation feature.
+    """
+    env = AshCrownEnv(mode="run", max_ticks=64, **env_kwargs)
+    try:
+        assert env.mode == "run"
+        assert env.max_ticks == 64
+        obs, info = env.reset(seed=20260101)
+        assert info["mode"] == "run"
+        assert info["level"] == 1
+        assert info["merchant_policy"] == "none"
+        assert env.layout.level(obs) == 1
+        assert env.layout.value(obs, "global", "mode_run") >= 0.5
+        assert env.layout.value(obs, "global", "mode_level") < 0.5
+        levels = [info["level"]]
+        terminated = truncated = False
+        for _ in range(64):
+            obs, _, terminated, truncated, info = env.step([0, 0, 0])
+            levels.append(info["level"])
+            if terminated or truncated:
+                break
+        assert truncated and not terminated
+        assert info["terminal_reason"] == "truncated"
+        assert set(levels) == {1}, "no descend happens without clearing the floor"
+        assert info["mode"] == "run"
+    finally:
+        env.close()
+
+
+@pytest.mark.integration
+def test_live_run_mode_default_cap_is_144k(env_kwargs: dict[str, Any]) -> None:
+    env = AshCrownEnv(mode="run", **env_kwargs)
+    try:
+        assert env.max_ticks == DEFAULT_RUN_MAX_TICKS
+        _, info = env.reset(seed=5)
+        assert info["mode"] == "run"
+        assert info["level"] == 1
     finally:
         env.close()
 
