@@ -28,6 +28,7 @@ the log a usable bug report. ``record`` and ``replay`` are both CLI-friendly::
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -173,11 +174,46 @@ def diff_state_lines(recorded: str, live: str) -> str:
     return text
 
 
-def default_policy(name: str, seed: int, layout: Layout) -> Policy:
-    """Policy resolution shared with :mod:`ashcrown_rl.evaluate`."""
+def default_policy(
+    name: str,
+    seed: int,
+    layout: Layout,
+    *,
+    checkpoint: str | None = None,
+    env: AshCrownEnv | None = None,
+) -> Policy:
+    """Policy resolution shared with :mod:`ashcrown_rl.evaluate`.
+
+    ``ppo`` records the actions of a trained checkpoint
+    (``--checkpoint model.zip``); the replay itself only needs the actions, so
+    a replay log never depends on the policy file.
+    """
     if name == "heuristic":
         return HeuristicPolicy(layout)
+    if name == "ppo":
+        return resolve_policy("ppo", seed, layout, checkpoint=checkpoint, env=env)
     return resolve_policy(name, seed)
+
+
+def read_log(path: str | Path) -> dict[str, Any]:
+    """Read a replay log (``.json`` or gzipped ``.json.gz``)."""
+    target = Path(path)
+    if target.suffix == ".gz":
+        with gzip.open(target, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def write_log(path: str | Path, log: Mapping[str, Any]) -> Path:
+    """Write a replay log, gzip-compressing when the path ends in ``.gz``."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.suffix == ".gz":
+        with gzip.open(target, "wt", encoding="utf-8") as handle:
+            json.dump(dict(log), handle, indent=1)
+    else:
+        target.write_text(json.dumps(dict(log), indent=1) + "\n", encoding="utf-8")
+    return target
 
 
 def record(
@@ -336,7 +372,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     recorder.add_argument("--character", default="warrior")
     recorder.add_argument("--frame-skip", type=int, default=4)
     recorder.add_argument("--max-ticks", type=int, default=18_000)
-    recorder.add_argument("--policy", default="heuristic", help="heuristic | random | zero")
+    recorder.add_argument("--policy", default="heuristic", help="heuristic | random | zero | ppo")
+    recorder.add_argument(
+        "--checkpoint", default=None, help="PPO checkpoint (.zip) recorded by --policy ppo"
+    )
     recorder.add_argument("--mode", default="level", help="level | run (RL-5)")
     recorder.add_argument(
         "--merchant-policy", default=None, help="engine merchant sub-policy (none | auto_heal)"
@@ -367,7 +406,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 project=args.game_project,
             )
             try:
-                policy = default_policy(args.policy, args.seed, env.layout)
+                policy = default_policy(
+                    args.policy, args.seed, env.layout, checkpoint=args.checkpoint, env=env
+                )
                 log = record(
                     env,
                     seed=args.seed,
@@ -377,9 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             finally:
                 env.close()
-            path = Path(args.out)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(log, indent=1) + "\n", encoding="utf-8")
+            path = write_log(args.out, log)
             print(
                 "REPLAY_RECORD "
                 + json.dumps(
@@ -394,7 +433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        log = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        log = read_log(args.file)
         config = dict(log.get("config") or {})
         env = AshCrownEnv(
             mode=str(config.get("mode", "level")),
@@ -429,9 +468,11 @@ __all__ = [
     "default_policy",
     "diff_state_lines",
     "main",
+    "read_log",
     "record",
     "replay",
     "state_line",
+    "write_log",
 ]
 
 

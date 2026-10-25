@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -87,14 +89,42 @@ POLICIES: Mapping[str, Policy] = {
 }
 
 
-def resolve_policy(name: str, seed: int, layout: Layout | None = None) -> Policy:
+def ppo_model_policy(model: Any) -> Policy:
+    """Wrap a loaded Stable-Baselines3 model as an evaluation policy."""
+
+    def _policy(obs: np.ndarray, info: Mapping[str, Any], layout: Layout) -> list[int]:
+        action, _state = model.predict(obs, deterministic=True)
+        return [int(value) for value in action]
+
+    return _policy
+
+
+def resolve_policy(
+    name: str,
+    seed: int,
+    layout: Layout | None = None,
+    *,
+    checkpoint: str | None = None,
+    env: AshCrownEnv | None = None,
+    model: Any = None,
+) -> Policy:
     """Policy callable for ``--policy``.
 
     ``heuristic`` (the default) is :class:`~ashcrown_rl.baseline.HeuristicPolicy`
     — the pure core plus the anti-stuck guard — and needs the layout, which
     :func:`run_episode` supplies on the first call. ``random`` is seeded per
-    episode; ``zero`` stands still.
+    episode; ``zero`` stands still. ``ppo`` needs a trained checkpoint
+    (``--checkpoint``) whose metadata is verified against ``env``.
     """
+    if name == "ppo":
+        trained = model
+        if trained is None:
+            if not checkpoint:
+                raise ValueError("--policy ppo needs --checkpoint <model.zip>")
+            from .train import load_policy  # noqa: PLC0415 - keeps numpy-only imports light
+
+            trained = load_policy(checkpoint, env)
+        return ppo_model_policy(trained)
     if name == "heuristic":
         if layout is None:
             raise ValueError("the heuristic policy needs the env layout")
@@ -392,6 +422,189 @@ def _episode_summary(episodes: Sequence[EpisodeMetrics]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Pins, config and the parallel PPO path
+# --------------------------------------------------------------------------- #
+def _pins(env: AshCrownEnv) -> dict[str, Any]:
+    """The environment pins recorded next to an evaluation result."""
+    return {
+        "protocol": env.hello.get("protocol"),
+        "obs_schema": env.hello.get("obs_schema") or env.layout.obs_schema,
+        "action_schema": env.hello.get("action_schema"),
+        "layout_hash": env.layout_hash,
+        "obs_len": env.obs_len,
+        "observation_config": env.observation_config(),
+        "physics_ticks_per_second": env.hello.get("physics_ticks_per_second"),
+        "frame_skip": env.frame_skip,
+    }
+
+
+def _config(
+    env: AshCrownEnv,
+    *,
+    policy_name: str,
+    seeds: Sequence[int],
+    repeat: int,
+    level: int | None,
+    checkpoint: str | None = None,
+) -> dict[str, Any]:
+    """The run configuration recorded next to an evaluation result."""
+    config = {
+        "level": level if level is not None else env.level,
+        "character": env.character,
+        "mode": env.mode,
+        "frame_skip": env.frame_skip,
+        "max_ticks": env.max_ticks,
+        "reward_profile": env.reward_profile,
+        **env.observation_config(),
+        "policy": policy_name,
+        "seeds": [int(seed) for seed in seeds],
+        "repeat": int(repeat),
+    }
+    if checkpoint:
+        config["checkpoint"] = str(checkpoint)
+    return config
+
+
+def _ppo_chunk(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Evaluate one seed chunk of a PPO checkpoint in its own process.
+
+    One task per worker (not per seed) so each worker builds its Godot process
+    and loads the model once, closes both, and returns the whole chunk — a
+    worker that dies leaves no stray process behind.
+    """
+    env = AshCrownEnv(**dict(payload["env_kwargs"]))
+    try:
+        policy = resolve_policy(
+            "ppo", 0, env.layout, checkpoint=str(payload["checkpoint"]), env=env
+        )
+        episodes = [
+            run_episode(
+                env,
+                seed=int(seed),
+                policy=policy,
+                policy_name="ppo",
+                level=payload.get("level"),
+                options=payload.get("options"),
+                max_steps=payload.get("max_steps"),
+                record_hashes=False,
+            )
+            for seed in payload["seeds"]
+        ]
+        config = _config(
+            env,
+            policy_name="ppo",
+            seeds=payload["seeds"],
+            repeat=1,
+            level=payload.get("level"),
+            checkpoint=str(payload["checkpoint"]),
+        )
+        return {"episodes": episodes, "pins": _pins(env), "config": config}
+    finally:
+        env.close()
+
+
+def split_seeds(seeds: Sequence[int], workers: int) -> list[list[int]]:
+    """Contiguous, balanced chunks of ``seeds`` (order preserved on merge)."""
+    count = max(int(workers), 1)
+    total = len(seeds)
+    if total == 0:
+        return []
+    size = max(1, (total + count - 1) // count)
+    return [list(seeds[index : index + size]) for index in range(0, total, size)]
+
+
+def evaluate_ppo(
+    *,
+    checkpoint: str,
+    seeds: Sequence[int],
+    env_kwargs: Mapping[str, Any] | None = None,
+    level: int | None = None,
+    options: Mapping[str, Any] | None = None,
+    max_steps: int | None = None,
+    workers: int = 1,
+    csv_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Fixed-seed PPO evaluation, optionally over ``workers`` processes."""
+    started_wall = datetime.now(UTC).isoformat(timespec="seconds")
+    clock = time.perf_counter()
+    seeds = [int(seed) for seed in seeds]
+    if int(workers) <= 1:
+        env = AshCrownEnv(**dict(env_kwargs or {}))
+        try:
+            policy = resolve_policy("ppo", 0, env.layout, checkpoint=checkpoint, env=env)
+            episodes = [
+                run_episode(
+                    env,
+                    seed=seed,
+                    policy=policy,
+                    policy_name="ppo",
+                    level=level,
+                    options=options,
+                    max_steps=max_steps,
+                    record_hashes=False,
+                )
+                for seed in seeds
+            ]
+            pins = _pins(env)
+            config = _config(
+                env,
+                policy_name="ppo",
+                seeds=seeds,
+                repeat=1,
+                level=level,
+                checkpoint=str(checkpoint),
+            )
+        finally:
+            env.close()
+    else:
+        chunks = split_seeds(seeds, int(workers))
+        payloads = [
+            {
+                "checkpoint": str(checkpoint),
+                "env_kwargs": dict(env_kwargs or {}),
+                "seeds": chunk,
+                "level": level,
+                "options": dict(options or {}),
+                "max_steps": max_steps,
+            }
+            for chunk in chunks
+        ]
+        context = multiprocessing.get_context("spawn")
+        episodes = []
+        pins: dict[str, Any] = {}
+        config: dict[str, Any] = {}
+        with ProcessPoolExecutor(
+            max_workers=min(int(workers), len(payloads)), mp_context=context
+        ) as pool:
+            results = list(pool.map(_ppo_chunk, payloads))
+        for result in results:
+            pins = pins or result["pins"]
+            config = config or result["config"]
+            episodes.extend(result["episodes"])
+        episodes.sort(key=lambda metrics: metrics.seed)
+    elapsed = time.perf_counter() - clock
+    summary = _episode_summary(episodes)
+    if csv_path is not None:
+        write_csv(csv_path, episodes)
+    return {
+        "generated": started_wall,
+        "elapsed_seconds": round(elapsed, 3),
+        "pins": pins,
+        "config": config,
+        "episodes": [metrics.as_dict() for metrics in episodes],
+        "aggregates": summary,
+        "determinism": {
+            "repeats": 1,
+            "identical": True,
+            "mismatched_seeds": [],
+            "compared_hashes": 0,
+            "note": "determinism check runs on --repeat > 1 (sequential path)",
+        },
+        "workers": int(workers),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # CSV artifact
 # --------------------------------------------------------------------------- #
 #: Column order of the per-episode combat CSV (``--csv``).
@@ -465,7 +678,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m ashcrown_rl.evaluate",
         description="Fixed-seed evaluation of a scripted policy on the real headless environment.",
     )
-    parser.add_argument("--policy", default="heuristic", help="heuristic | random | zero")
+    parser.add_argument("--policy", default="heuristic", help="heuristic | random | zero | ppo")
+    parser.add_argument("--checkpoint", default=None, help="PPO checkpoint (.zip) for --policy ppo")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel evaluation processes for --policy ppo (default 1)",
+    )
     parser.add_argument("--level", type=int, default=1, help="level to evaluate (default 1)")
     parser.add_argument("--character", default="warrior", help="character id")
     parser.add_argument("--frame-skip", type=int, default=4, help="physics ticks per step")
@@ -498,15 +718,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "project": args.game_project,
     }
     try:
-        report = evaluate(
-            seeds=seeds,
-            policy_name=args.policy,
-            env_kwargs=env_kwargs,
-            repeat=args.repeat,
-            max_steps=args.max_steps,
-            with_hashes=args.with_hashes,
-            csv_path=args.csv,
-        )
+        if args.policy == "ppo":
+            report = evaluate_ppo(
+                checkpoint=str(args.checkpoint or ""),
+                seeds=seeds,
+                env_kwargs=env_kwargs,
+                level=None,
+                max_steps=args.max_steps,
+                workers=args.workers,
+                csv_path=args.csv,
+            )
+        else:
+            report = evaluate(
+                seeds=seeds,
+                policy_name=args.policy,
+                env_kwargs=env_kwargs,
+                repeat=args.repeat,
+                max_steps=args.max_steps,
+                with_hashes=args.with_hashes,
+                csv_path=args.csv,
+            )
     except (ProtocolError, OSError, ValueError) as exc:
         print(f"EVAL_FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
