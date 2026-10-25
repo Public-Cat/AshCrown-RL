@@ -5,6 +5,11 @@ aggregate round-trips through ``.npz`` with its provenance intact, the provenanc
 split is what the report table reads, the per-round CSV is stable, and a tiny
 in-memory policy is enough to check that :func:`head_report` exposes the
 label-versus-predicted-rate pair that detects a rare head which never fires.
+
+The in-memory policy is a torch tensor policy and the diagnostics come from
+``scripts/bc_diagnose.py``, so this module needs the optional ``train`` extra
+(``torch`` + ``stable-baselines3``): it skips as a whole instead of failing
+collection in the documented dev-only gate (``docs/07`` §12.3, INT-97).
 """
 
 from __future__ import annotations
@@ -13,6 +18,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+pytest.importorskip("torch", reason="the DAgger diagnostics need the train extra")
+pytest.importorskip("stable_baselines3", reason="the DAgger diagnostics need the train extra")
+
 import torch as th
 from stable_baselines3.common.distributions import MultiCategoricalDistribution
 

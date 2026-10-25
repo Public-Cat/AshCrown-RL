@@ -63,9 +63,7 @@ def head_metrics(
         "labels": label_counts,
         "predicted": predicted_counts,
         "label_rate": [round(count / max(len(labels), 1), 5) for count in label_counts],
-        "predicted_rate": [
-            round(count / max(len(labels), 1), 5) for count in predicted_counts
-        ],
+        "predicted_rate": [round(count / max(len(labels), 1), 5) for count in predicted_counts],
         "mean_prob_of_label": float(np.mean(chosen)),
         "mean_nll": float(-np.mean(np.log(np.clip(chosen, 1e-12, 1.0)))),
     }
@@ -94,9 +92,7 @@ def measure(
         # three per-head ``Categorical`` objects (SB3 >= 2.x).
         logits = [head.logits for head in distribution.distribution]
         per_head = [
-            head_metrics(
-                HEADS[index], actions[:, index], np.asarray(logit), confusion=confusion
-            )
+            head_metrics(HEADS[index], actions[:, index], np.asarray(logit), confusion=confusion)
             for index, logit in enumerate(logits)
         ]
         joint = np.stack([np.argmax(np.asarray(logit), axis=1) for logit in logits], axis=1)
@@ -206,9 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             keep[rows] = True
         rows_obs = dataset.obs[keep]
         if dataset.episode_ids is not None:
-            rows_obs = stack_observations(
-                rows_obs, stack_indices(dataset.episode_ids[keep], stack)
-            )
+            rows_obs = stack_observations(rows_obs, stack_indices(dataset.episode_ids[keep], stack))
         report["dataset"] = {
             "path": str(args.dataset),
             "source": args.source,

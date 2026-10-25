@@ -231,9 +231,7 @@ def collect_dagger(
     )
 
 
-def head_weights(
-    actions: np.ndarray, classes: list[int], cap: float
-) -> list[np.ndarray]:
+def head_weights(actions: np.ndarray, classes: list[int], cap: float) -> list[np.ndarray]:
     """Inverse-frequency class weights, capped per class (``cap`` disables at 1)."""
     weights: list[np.ndarray] = []
     for index, count in enumerate(classes):
@@ -251,8 +249,7 @@ def label_stats(actions: np.ndarray, classes: list[int]) -> list[dict[str, Any]]
         {
             "head": index,
             "counts": [
-                int(value)
-                for value in np.bincount(actions[:, index], minlength=int(count))
+                int(value) for value in np.bincount(actions[:, index], minlength=int(count))
             ],
         }
         for index, count in enumerate(classes)
@@ -430,8 +427,7 @@ def main(argv: list[str] | None = None) -> int:
         weights = head_weights(actions, classes, args.weight_cap)
         if args.weight_cap > 1.0:
             print(
-                "BC_WEIGHTS "
-                + json.dumps({"weights": [value.tolist() for value in weights]}),
+                "BC_WEIGHTS " + json.dumps({"weights": [value.tolist() for value in weights]}),
                 flush=True,
             )
         initial = (

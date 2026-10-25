@@ -91,13 +91,9 @@ class Dataset:
                     f"obs rows {self.obs.shape[0]} != episode rows {self.episode_ids.shape[0]}"
                 )
         if self.obs.shape[0] != self.actions.shape[0]:
-            raise ValueError(
-                f"obs rows {self.obs.shape[0]} != action rows {self.actions.shape[0]}"
-            )
+            raise ValueError(f"obs rows {self.obs.shape[0]} != action rows {self.actions.shape[0]}")
         if self.obs.shape[0] != self.sources.shape[0]:
-            raise ValueError(
-                f"obs rows {self.obs.shape[0]} != source rows {self.sources.shape[0]}"
-            )
+            raise ValueError(f"obs rows {self.obs.shape[0]} != source rows {self.sources.shape[0]}")
 
     @property
     def samples(self) -> int:
@@ -169,9 +165,7 @@ def append_samples(
     new_actions = np.asarray(actions, dtype=np.int64)
     new_sources = np.full(new_obs.shape[0], int(source), dtype=np.int8)
     new_episodes = (
-        np.asarray(episode_ids, dtype=np.int64).reshape(-1)
-        if episode_ids is not None
-        else None
+        np.asarray(episode_ids, dtype=np.int64).reshape(-1) if episode_ids is not None else None
     )
     if dataset is None:
         return Dataset(
@@ -328,9 +322,7 @@ def write_rounds(rows: Sequence[dict[str, Any]], path: str | Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     lines = [",".join(ROUND_COLUMNS)]
     for row in rows:
-        lines.append(
-            ",".join(_format_cell(row.get(column)) for column in ROUND_COLUMNS)
-        )
+        lines.append(",".join(_format_cell(row.get(column)) for column in ROUND_COLUMNS))
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     target.with_suffix(".json").write_text(
         json.dumps(list(rows), indent=2) + "\n", encoding="utf-8"

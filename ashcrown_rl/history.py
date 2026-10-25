@@ -101,9 +101,7 @@ def stack_indices(episode_ids: Sequence[int] | np.ndarray, frame_stack: int) -> 
     return np.maximum(rows, starts[:, None])
 
 
-def stack_observations(
-    obs: np.ndarray, indices: np.ndarray | None = None
-) -> np.ndarray:
+def stack_observations(obs: np.ndarray, indices: np.ndarray | None = None) -> np.ndarray:
     """Gather ``obs`` into stacked observations using :func:`stack_indices` output."""
     values = np.asarray(obs, dtype=np.float32)
     if indices is None:

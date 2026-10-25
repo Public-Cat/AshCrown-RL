@@ -256,9 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         started = time.perf_counter()
         weights = head_weights(dataset.actions, classes, args.weight_cap)
         stack_index = (
-            stack_indices(dataset.episode_ids, stack)
-            if dataset.episode_ids is not None
-            else None
+            stack_indices(dataset.episode_ids, stack) if dataset.episode_ids is not None else None
         )
         print(
             "DAGGER_STACK "
@@ -340,8 +338,7 @@ def main(argv: list[str] | None = None) -> int:
                         "training": git_commit(Path(__file__).resolve().parents[1]),
                         "game": git_commit(Path(__file__).resolve().parents[2]),
                     },
-                    "command": "uv run python examples/dagger_rounds.py "
-                    + " ".join(sys.argv[1:]),
+                    "command": "uv run python examples/dagger_rounds.py " + " ".join(sys.argv[1:]),
                 },
             )
         finally:
