@@ -1,19 +1,32 @@
 """Behaviour-cloning warm start from the scripted heuristic (RL-7 helper).
 
-PPO cannot bootstrap from a standing start on level 1: an untrained policy
-holds the attack pulse so the committed swing (which ignores movement) locks the
-player in place for the whole episode, and every episode returns the same
-(negative) sum — zero advantage, zero gradient. This script collects heuristic
-demonstrations in parallel and fits the PPO policy's action heads by
-cross-entropy, so the fine-tuning run starts from a policy that already walks,
-faces and swings; ``examples/train_ppo.py --init-checkpoint`` then continues
-with PPO (the engine reward, not the demonstrator).
+PPO cannot bootstrap from a standing start on level 1: an untrained policy holds
+the attack pulse so the committed swing (which ignores movement) locks the player
+in place for the whole episode, and every episode returns the same (negative)
+sum — zero advantage, zero gradient. This script collects heuristic
+demonstrations and fits the PPO policy's action heads by cross-entropy, so the
+fine-tuning run starts from a policy that already walks, faces and swings;
+``examples/train_ppo.py --init-checkpoint`` then continues with PPO (the engine
+reward, not the demonstrator).
 
-The demonstrator is the *shipped* baseline (``docs/07`` §9.4, 8/10 clears); the
-demonstration data is discarded after the fit:
+The demonstrator is the *shipped* baseline (``docs/07`` §9.4, 8/10 clears).
 
-    uv run python examples/bc_pretrain.py --steps 24000 --n-envs 8 \
-        --level 1 --out /tmp/rl7/bc_level1.zip
+Two things make the clone usable rather than merely well-fitting
+(``RL7-report.md`` §5, round 2):
+
+* **per-head class weighting** — the attack head fires on ~2-3 % of the windows
+  and the interact head on ~0.1 %, so a plain cross-entropy collapses both to
+  "never"; the weights are inverse class frequency (capped by ``--weight-cap``),
+  which restores the demonstrator's attack rate;
+* **DAgger rounds** — a clone that only ever sees demonstrator states suffers
+  covariate shift: a 72 % per-window move accuracy is enough to leave the
+  demonstrator's manifold within a second, and off-manifold there are no labels
+  at all. Each round rolls the *current policy*, asks the heuristic what it
+  would have done on those states, and retrains on the aggregate.
+
+    uv run python examples/bc_pretrain.py --steps 144000 --n-envs 16 --level 1 \
+        --epochs 12 --dagger-rounds 2 --dagger-steps 48000 \
+        --out /tmp/rl7/bc3/bc_level1.zip
 """
 
 from __future__ import annotations
@@ -43,40 +56,160 @@ from ashcrown_rl.train import (  # noqa: E402
 from ashcrown_rl.vec import make_vec_env  # noqa: E402
 
 
+def _label_batch(
+    policies: list[HeuristicPolicy],
+    obs: np.ndarray,
+    infos: Any,
+    n_envs: int,
+) -> np.ndarray:
+    """The heuristic's action for every env of one vector step."""
+    actions = []
+    for index in range(n_envs):
+        info = _env_info(infos, index) if isinstance(infos, dict) else infos[index]
+        actions.append(np.asarray(policies[index](obs[index], info, None)))
+    return np.stack(actions).astype(np.int64)
+
+
 def collect(
     *,
     n_envs: int,
     steps: int,
     seed: int,
     env_kwargs: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Roll the heuristic on ``n_envs`` processes and return ``(obs, actions)``."""
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Roll the heuristic on ``n_envs`` processes and return ``(obs, actions, stats)``.
+
+    Each row is ``(observation at decision t, action the heuristic chose at that
+    same observation)`` — the pairing is built in one statement per step, before
+    the environment is advanced, so no off-by-one is possible.
+    """
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs)
+    stats = {"episodes": 0, "clears": 0}
     try:
-        # The layout is published per env; build the policies from a probe env.
         probe = AshCrownEnv(**env_kwargs)
         try:
             policies = [HeuristicPolicy(probe.layout) for _ in range(int(n_envs))]
-            probe.close()
         finally:
             probe.close()
-        obs, _infos = vec.reset()
+        obs, infos = vec.reset()
         collected = 0
         while collected < int(steps):
-            actions_batch = []
-            for index in range(int(n_envs)):
-                info = _env_info(_infos, index) if isinstance(_infos, dict) else _infos[index]
-                actions_batch.append(np.asarray(policies[index](obs[index], info, None)))
-            actions_batch_array = np.stack(actions_batch)
+            actions_batch = _label_batch(policies, obs, infos, int(n_envs))
             observations.append(np.asarray(obs, dtype=np.float32).copy())
-            actions.append(actions_batch_array.astype(np.int64))
+            actions.append(actions_batch)
             collected += int(n_envs)
-            obs, _rewards, _terminated, _truncated, _infos = vec.step(actions_batch_array)
+            obs, _rewards, terminated, _truncated, infos = vec.step(actions_batch)
+            stats["episodes"] += int(np.sum(terminated))
+            stats["clears"] += _clear_count(infos, int(n_envs))
+            for index in range(int(n_envs)):
+                if int(_env_info(infos, index).get("episode_steps", 1) or 0) == 0:
+                    # Auto-reset: the demonstrator's memory (nav map, pocket
+                    # guard, sweep ring) belongs to the *previous* level. Leaking
+                    # it across episodes measurably breaks the demonstrator —
+                    # the RL-7 round-2 measurement was 0 clears in 25 episodes
+                    # with a leaked policy versus 8/10 with a fresh one.
+                    policies[index] = HeuristicPolicy(policies[index].layout)
     finally:
         vec.close()
-    return np.concatenate(observations), np.concatenate(actions)
+    return np.concatenate(observations), np.concatenate(actions), stats
+
+
+def _clear_count(infos: Any, n_envs: int) -> int:
+    """How many envs of this vector step finished on the level-clear terminal.
+
+    With ``autoreset_mode=SAME_STEP`` the *top-level* info of a finished env is
+    already the **reset** info of the next episode; the finished episode's own
+    info is nested under ``final_info``. Reading ``terminal_reason`` from the top
+    level reports 0 clears even when every episode cleared (the RL-7 round-2
+    first measurement bug).
+    """
+    clears = 0
+    for index in range(n_envs):
+        info = _env_info(infos, index)
+        final = info.get("final_info") or {}
+        reason = str(info.get("terminal_reason") or final.get("terminal_reason") or "")
+        if reason in ("level_clear", "portal_entered"):
+            clears += 1
+    return clears
+
+
+def collect_dagger(
+    *,
+    model: PPO,
+    n_envs: int,
+    steps: int,
+    seed: int,
+    env_kwargs: dict[str, Any],
+    stochastic: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Roll ``model`` and label its own visited states with the heuristic (DAgger)."""
+    observations: list[np.ndarray] = []
+    actions: list[np.ndarray] = []
+    vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs)
+    stats = {"episodes": 0, "clears": 0}
+    try:
+        probe = AshCrownEnv(**env_kwargs)
+        try:
+            policies = [HeuristicPolicy(probe.layout) for _ in range(int(n_envs))]
+        finally:
+            probe.close()
+        obs, infos = vec.reset()
+        collected = 0
+        while collected < int(steps):
+            labels = _label_batch(policies, obs, infos, int(n_envs))
+            # The executed action comes from the *policy*, the label from the
+            # demonstrator; only the label is learned.
+            executed = np.stack(
+                [
+                    np.asarray(model.predict(obs[index], deterministic=not stochastic)[0])
+                    for index in range(int(n_envs))
+                ]
+            ).astype(np.int64)
+            observations.append(np.asarray(obs, dtype=np.float32).copy())
+            actions.append(labels)
+            collected += int(n_envs)
+            obs, _rewards, terminated, _truncated, infos = vec.step(executed)
+            stats["episodes"] += int(np.sum(terminated))
+            stats["clears"] += _clear_count(infos, int(n_envs))
+            for index in range(int(n_envs)):
+                info = _env_info(infos, index)
+                if int(info.get("episode_steps", 1) or 0) == 0:
+                    # Auto-reset happened for this env: the heuristic's memory
+                    # (nav map, pocket guard, sweep) belongs to the old episode.
+                    policies[index] = HeuristicPolicy(policies[index].layout)
+    finally:
+        vec.close()
+    return np.concatenate(observations), np.concatenate(actions), stats
+
+
+def head_weights(
+    actions: np.ndarray, classes: list[int], cap: float
+) -> list[np.ndarray]:
+    """Inverse-frequency class weights, capped per class (``cap`` disables at 1)."""
+    weights: list[np.ndarray] = []
+    for index, count in enumerate(classes):
+        labels = actions[:, index]
+        totals = np.bincount(labels, minlength=int(count)).astype(np.float64)
+        present = np.maximum(totals, 1.0)
+        weight = totals.sum() / (float(count) * present)
+        weights.append(np.clip(weight, 1.0, max(float(cap), 1.0)).astype(np.float32))
+    return weights
+
+
+def label_stats(actions: np.ndarray, classes: list[int]) -> list[dict[str, Any]]:
+    """Per-head label counts, for the log (an all-zero head is a dead head)."""
+    return [
+        {
+            "head": index,
+            "counts": [
+                int(value)
+                for value in np.bincount(actions[:, index], minlength=int(count))
+            ],
+        }
+        for index, count in enumerate(classes)
+    ]
 
 
 def fit(
@@ -89,39 +222,55 @@ def fit(
     seed: int,
     net_arch: list[int],
     device: str = "cpu",
+    model: PPO | None = None,
+    weights: list[np.ndarray] | None = None,
 ) -> PPO:
-    """Fit a fresh PPO policy's action heads to ``actions`` by cross-entropy."""
-    env_kwargs = {"level": 1, "frame_skip": 4, "max_ticks": 600}
-    vec = make_training_vec_env(n_envs=1, seed=int(seed), env_kwargs=env_kwargs)
-    try:
-        model = PPO(
-            "MlpPolicy",
-            vec,
-            device=device,
-            seed=int(seed),
-            verbose=0,
-            policy_kwargs={"net_arch": list(net_arch)},
-        )
-    finally:
-        vec.close()
+    """Fit the policy's action heads to ``actions`` by (weighted) cross-entropy."""
+    if model is None:
+        env_kwargs = {"level": 1, "frame_skip": 4, "max_ticks": 600}
+        vec = make_training_vec_env(n_envs=1, seed=int(seed), env_kwargs=env_kwargs)
+        try:
+            model = PPO(
+                "MlpPolicy",
+                vec,
+                device=device,
+                seed=int(seed),
+                verbose=0,
+                policy_kwargs={"net_arch": list(net_arch)},
+            )
+        finally:
+            vec.close()
     optimizer = th.optim.Adam(model.policy.parameters(), lr=float(learning_rate))
     obs_tensor = th.as_tensor(observations, dtype=th.float32, device=device)
     action_tensor = th.as_tensor(actions, dtype=th.long, device=device)
     count = len(observations)
     rng = np.random.default_rng(int(seed))
     model.policy.set_training_mode(True)
+    weight_tensors = (
+        [th.as_tensor(value, dtype=th.float32, device=device) for value in weights]
+        if weights is not None
+        else None
+    )
     for epoch in range(int(epochs)):
         order = rng.permutation(count)
         total = 0.0
         for start in range(0, count, int(batch_size)):
             batch = order[start : start + int(batch_size)]
-            distribution = model.policy.get_distribution(obs_tensor[batch])
-            loss = -distribution.log_prob(action_tensor[batch]).mean()
+            heads = model.policy.get_distribution(obs_tensor[batch]).distribution
+            losses = []
+            for index, head in enumerate(heads):
+                log_prob = head.log_prob(action_tensor[batch, index])
+                if weight_tensors is not None:
+                    log_prob = log_prob * weight_tensors[index][action_tensor[batch, index]]
+                losses.append(-log_prob.mean())
+            loss = losses[0]
+            for extra in losses[1:]:
+                loss = loss + extra
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total += float(loss.item()) * len(batch)
-        if epoch == 0 or (epoch + 1) % 10 == 0:
+        if epoch == 0 or (epoch + 1) % 5 == 0:
             print(
                 "BC_EPOCH " + json.dumps({"epoch": epoch + 1, "loss": round(total / count, 5)}),
                 flush=True,
@@ -147,6 +296,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--net-arch", default="256,256")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--weight-cap",
+        type=float,
+        default=1.0,
+        help="cap on the inverse-frequency class weight (1 = plain cross-entropy)",
+    )
+    parser.add_argument("--dagger-rounds", type=int, default=0, help="DAgger iterations")
+    parser.add_argument("--dagger-steps", type=int, default=32_000, help="decisions per round")
+    parser.add_argument(
+        "--dagger-deterministic",
+        action="store_true",
+        help="roll the DAgger policy deterministically (default: stochastic, for coverage)",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="continue cloning an existing checkpoint instead of a fresh net",
+    )
     parser.add_argument("--game-project", default=None)
     parser.add_argument("--godot-bin", default=None)
     parser.add_argument("--out", required=True, help="checkpoint to write (*.zip)")
@@ -166,15 +333,37 @@ def main(argv: list[str] | None = None) -> int:
     }
     net_arch = [int(value) for value in str(args.net_arch).replace(",", " ").split()]
     try:
-        observations, actions = collect(
+        observations, actions, collect_stats = collect(
             n_envs=args.n_envs, steps=args.steps, seed=args.seed, env_kwargs=env_kwargs
         )
+        probe = AshCrownEnv(**env_kwargs)
+        try:
+            classes = [int(value) for value in probe.action_space.nvec]
+        finally:
+            probe.close()
         print(
             "BC_DATA "
             + json.dumps(
-                {"samples": int(len(observations)), "obs_len": int(observations.shape[1])}
+                {
+                    "samples": int(len(observations)),
+                    "obs_len": int(observations.shape[1]),
+                    "stats": collect_stats,
+                    "labels": label_stats(actions, classes),
+                }
             ),
             flush=True,
+        )
+        weights = head_weights(actions, classes, args.weight_cap)
+        if args.weight_cap > 1.0:
+            print(
+                "BC_WEIGHTS "
+                + json.dumps({"weights": [value.tolist() for value in weights]}),
+                flush=True,
+            )
+        initial = (
+            PPO.load(str(args.init_checkpoint), device=args.device)
+            if args.init_checkpoint
+            else None
         )
         model = fit(
             observations=observations,
@@ -185,7 +374,46 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             net_arch=net_arch,
             device=args.device,
+            model=initial,
+            weights=weights if args.weight_cap > 1.0 else None,
         )
+        for round_index in range(int(args.dagger_rounds)):
+            new_obs, new_actions, stats = collect_dagger(
+                model=model,
+                n_envs=args.n_envs,
+                steps=args.dagger_steps,
+                seed=int(args.seed) + 1000 + round_index,
+                env_kwargs=env_kwargs,
+                stochastic=not args.dagger_deterministic,
+            )
+            observations = np.concatenate([observations, new_obs])
+            actions = np.concatenate([actions, new_actions])
+            print(
+                "BC_DAGGER "
+                + json.dumps(
+                    {
+                        "round": round_index + 1,
+                        "samples": int(len(observations)),
+                        "new": int(len(new_obs)),
+                        "stats": stats,
+                        "labels": label_stats(new_actions, classes),
+                    }
+                ),
+                flush=True,
+            )
+            weights = head_weights(actions, classes, args.weight_cap)
+            model = fit(
+                observations=observations,
+                actions=actions,
+                epochs=max(3, int(args.epochs) // 2),
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                seed=int(args.seed) + 1 + round_index,
+                net_arch=net_arch,
+                device=args.device,
+                model=model,
+                weights=weights if args.weight_cap > 1.0 else None,
+            )
     except (ProtocolError, OSError, ValueError) as exc:
         print(f"BC_FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -208,6 +436,10 @@ def main(argv: list[str] | None = None) -> int:
                 "frame_skip": probe.frame_skip,
                 "samples": int(len(observations)),
                 "epochs": int(args.epochs),
+                "weight_cap": float(args.weight_cap),
+                "dagger_rounds": int(args.dagger_rounds),
+                "dagger_steps": int(args.dagger_steps),
+                "class_weights": [value.tolist() for value in weights],
                 "demonstrator": "heuristic",
                 "git": {
                     "training": git_commit(Path(__file__).resolve().parents[1]),

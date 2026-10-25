@@ -85,6 +85,10 @@ CURVE_COLUMNS: tuple[str, ...] = (
     "approx_kl",
     "clears",
     "mean_game_seconds",
+    "kills",
+    "hits_landed",
+    "attacks_started",
+    "bc_loss",
     "wall_seconds",
 )
 
@@ -278,6 +282,12 @@ class Sb3AshCrownVecEnv(VecEnv):
         self.finished: list[dict[str, Any]] = []
         self._episode_return = np.zeros(self.num_envs, dtype=np.float64)
         self._episode_length = np.zeros(self.num_envs, dtype=np.int64)
+        # Per-episode combat counters. The engine reports ``events`` per step and
+        # ``kills`` cumulatively, so both are folded here: the RL-7 round-2
+        # acceptance gate is "did the policy keep landing hits", which a reward
+        # curve alone cannot show.
+        self._episode_hits = np.zeros(self.num_envs, dtype=np.int64)
+        self._episode_swings = np.zeros(self.num_envs, dtype=np.int64)
 
     # SB3 requires these delegations ----------------------------------------
     def get_attr(self, attr_name: str, indices: VecEnvIndices = None) -> list[Any]:
@@ -313,6 +323,8 @@ class Sb3AshCrownVecEnv(VecEnv):
         self._pending = None
         self._episode_return[:] = 0.0
         self._episode_length[:] = 0
+        self._episode_hits[:] = 0
+        self._episode_swings[:] = 0
         return np.asarray(obs, dtype=np.float32)
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -333,6 +345,9 @@ class Sb3AshCrownVecEnv(VecEnv):
         out_infos: list[dict[str, Any]] = []
         for index in range(self.num_envs):
             info = _env_info(vector_infos, index)
+            events = info.get("events") or {}
+            self._episode_hits[index] += int(events.get("hits_landed", 0) or 0)
+            self._episode_swings[index] += int(events.get("attacks_started", 0) or 0)
             if bool(dones[index]):
                 final = dict(info.get("final_info") or {})
                 record = {
@@ -341,6 +356,8 @@ class Sb3AshCrownVecEnv(VecEnv):
                     "terminal_reason": str(final.get("terminal_reason", "")),
                     "level": int(final.get("level", 0) or 0),
                     "kills": int(final.get("kills", 0) or 0),
+                    "hits_landed": int(self._episode_hits[index]),
+                    "attacks_started": int(self._episode_swings[index]),
                     "game_seconds": float(final.get("game_seconds", 0.0) or 0.0),
                 }
                 self.finished.append(record)
@@ -350,6 +367,8 @@ class Sb3AshCrownVecEnv(VecEnv):
                 info["level"] = record["level"]
                 self._episode_return[index] = 0.0
                 self._episode_length[index] = 0
+                self._episode_hits[index] = 0
+                self._episode_swings[index] = 0
             out_infos.append(info)
         return (
             np.asarray(obs, dtype=np.float32),
@@ -496,6 +515,10 @@ def _curve_row(
         "approx_kl": float(logger_values.get("train/approx_kl", math.nan)),
         "clears": clears,
         "mean_game_seconds": sum(float(e.get("game_seconds", 0.0)) for e in episodes) / count,
+        "kills": sum(float(e.get("kills", 0)) for e in episodes) / count,
+        "hits_landed": sum(float(e.get("hits_landed", 0)) for e in episodes) / count,
+        "attacks_started": sum(float(e.get("attacks_started", 0)) for e in episodes) / count,
+        "bc_loss": float(logger_values.get("train/bc_loss", math.nan)),
         "wall_seconds": round(float(wall_seconds), 3),
     }
 
@@ -586,6 +609,77 @@ class MetadataCheckpointCallback(BaseCallback):
         return target
 
 
+class AnchoredPPO(PPO):
+    """PPO whose update is pulled back toward a reference policy's actions.
+
+    RL-7 round 2 measured that PPO started from a behaviour-cloning warm start
+    walks *away* from the cloned combat behaviour as soon as the training-only
+    shaping term pays better than fighting (``RL7-report.md`` §5.1). The fix is
+    an explicit anchor: after every SB3 update this class takes ``bc_steps``
+    extra gradient steps that minimise the cross-entropy between the live action
+    heads and the actions ``anchor`` would have taken on the *rollout
+    observations that were just collected*, scaled by ``bc_coef``.
+
+    Because the anchor is a real policy rather than a fixed dataset, the
+    gradient follows the states the policy actually visits (the DAgger property)
+    and cannot be out-grown by a reward-hacking detour: the term is a divergence
+    from the reference behaviour, not a bonus for any state.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        anchor: PPO | None = None,
+        bc_coef: float = 0.0,
+        bc_steps: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        """Store the anchor policy and the strength of the cloning term."""
+        self._anchor = anchor
+        self._bc_coef = float(bc_coef)
+        self._bc_steps = int(bc_steps)
+        self.bc_loss: float = 0.0
+        super().__init__(*args, **kwargs)
+
+    def train(self) -> None:
+        """Run SB3's PPO update, then the behaviour-cloning anchor steps."""
+        super().train()
+        anchor = self._anchor
+        if anchor is None or self._bc_coef <= 0.0 or self._bc_steps <= 0:
+            return
+        import torch as th  # noqa: PLC0415 - torch is an optional training extra
+
+        buffer = self.rollout_buffer
+        if not buffer.full:
+            return
+        width = buffer.buffer_size * buffer.n_envs
+        self.policy.set_training_mode(True)
+        loss = None
+        for _ in range(self._bc_steps):
+            batch = next(buffer.get(min(int(self.batch_size), width)))
+            observations = batch.observations
+            with th.no_grad():
+                # ``_predict`` is SB3's tensor-side forward (no numpy round trip);
+                # for a MultiDiscrete action space it returns ``(n, 3)``.
+                target = anchor.policy._predict(observations, deterministic=True)
+            heads = self.policy.get_distribution(observations).distribution
+            terms = [
+                -head.log_prob(target[:, index]).mean()
+                for index, head in enumerate(heads[: int(target.shape[1])])
+            ]
+            loss = terms[0]
+            for extra in terms[1:]:
+                loss = loss + extra
+            self.policy.optimizer.zero_grad()
+            (self._bc_coef * loss).backward()
+            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy.optimizer.step()
+        if loss is not None:
+            self.bc_loss = float(loss.item())
+            self.logger.record("train/bc_loss", self.bc_loss)
+            self.logger.record("train/bc_coef", self._bc_coef)
+
+
 # --------------------------------------------------------------------------- #
 # Training entry point
 # --------------------------------------------------------------------------- #
@@ -658,6 +752,9 @@ def train_ppo(
     algorithm: Mapping[str, Any],
     hyperparameters: Mapping[str, Any] | None = None,
     init_checkpoint: str | None = None,
+    bc_anchor: str | None = None,
+    bc_coef: float = 0.0,
+    bc_steps: int = 1,
     device: str = "cpu",
     levels: Sequence[int] | None = None,
     shaping: Mapping[str, float] | None = None,
@@ -705,19 +802,30 @@ def train_ppo(
                 "algorithm": dict(algorithm),
                 "shaping": dict(shaping or {}),
                 "init_checkpoint": str(init_checkpoint or ""),
+                "bc_anchor": str(bc_anchor or ""),
+                "bc_coef": float(bc_coef),
+                "bc_steps": int(bc_steps),
             }
 
         hp = dict(hyperparameters or {})
         net_arch = hp.pop("net_arch", None)
         if net_arch:
             hp["policy_kwargs"] = {"net_arch": list(net_arch)}
-        model = PPO(
+        anchor = PPO.load(str(bc_anchor), device=device) if bc_anchor else None
+        model_class: type[PPO] = AnchoredPPO if anchor is not None else PPO
+        extra: dict[str, Any] = (
+            {"anchor": anchor, "bc_coef": float(bc_coef), "bc_steps": int(bc_steps)}
+            if anchor is not None
+            else {}
+        )
+        model = model_class(
             "MlpPolicy",
             vec,
             device=device,
             seed=int(seed),
             verbose=0,
             tensorboard_log=None,
+            **extra,
             **hp,
         )
         if init_checkpoint:
@@ -756,6 +864,7 @@ def train_ppo(
 __all__ = [
     "CURVE_COLUMNS",
     "METADATA_VERSION",
+    "AnchoredPPO",
     "CurriculumEnv",
     "LevelSchedule",
     "ShapingWrapper",

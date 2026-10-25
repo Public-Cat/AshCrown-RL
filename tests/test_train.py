@@ -156,8 +156,24 @@ def test_curve_row_aggregates_episodes_and_logger_values() -> None:
     row = _curve_row(
         timestep=4096,
         episodes=[
-            {"r": 10.0, "l": 100, "terminal_reason": "level_clear", "game_seconds": 30.0},
-            {"r": 0.0, "l": 300, "terminal_reason": "death", "game_seconds": 90.0},
+            {
+                "r": 10.0,
+                "l": 100,
+                "terminal_reason": "level_clear",
+                "game_seconds": 30.0,
+                "kills": 4,
+                "hits_landed": 20,
+                "attacks_started": 22,
+            },
+            {
+                "r": 0.0,
+                "l": 300,
+                "terminal_reason": "death",
+                "game_seconds": 90.0,
+                "kills": 0,
+                "hits_landed": 2,
+                "attacks_started": 10,
+            },
         ],
         logger_values={
             "train/entropy_loss": -2.5,
@@ -175,6 +191,11 @@ def test_curve_row_aggregates_episodes_and_logger_values() -> None:
     assert row["entropy"] == pytest.approx(2.5)
     assert row["clears"] == 1
     assert row["mean_game_seconds"] == pytest.approx(60.0)
+    # The RL-7 round-2 acceptance gate reads these: a policy that stops landing
+    # hits is reward hacking, not learning.
+    assert row["kills"] == pytest.approx(2.0)
+    assert row["hits_landed"] == pytest.approx(11.0)
+    assert row["attacks_started"] == pytest.approx(16.0)
 
 
 def test_curve_row_keeps_the_columns_when_nothing_finished() -> None:
@@ -255,6 +276,74 @@ def test_resolve_ppo_policy_needs_a_checkpoint() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Anchored PPO (behaviour-cloning anchor loss, RL-7 round 2)
+# --------------------------------------------------------------------------- #
+class _TinyObsEnv(gym.Env):
+    """Random-observation env with the AshCrown action space (no Godot)."""
+
+    observation_space = gym.spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
+    action_space = gym.spaces.MultiDiscrete([9, 2, 2])
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        super().reset(seed=seed)
+        return self.observation_space.sample().astype(np.float32), {}
+
+    def step(self, action: Any):
+        observation = self.observation_space.sample().astype(np.float32)
+        return observation, 0.0, False, False, {}
+
+
+def test_anchored_ppo_records_the_anchor_loss() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("stable_baselines3")
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from ashcrown_rl.train import AnchoredPPO
+
+    kwargs: dict[str, Any] = {
+        "n_steps": 64,
+        "batch_size": 32,
+        "n_epochs": 2,
+        "device": "cpu",
+        "policy_kwargs": {"net_arch": [16, 16]},
+    }
+    anchor = PPO("MlpPolicy", DummyVecEnv([_TinyObsEnv]), **kwargs)
+    model = AnchoredPPO(
+        "MlpPolicy",
+        DummyVecEnv([_TinyObsEnv]),
+        anchor=anchor,
+        bc_coef=0.5,
+        bc_steps=2,
+        **kwargs,
+    )
+    model.learn(total_timesteps=128, progress_bar=False)
+    assert model.bc_loss > 0.0
+    assert "train/bc_loss" in model.logger.name_to_value
+
+
+def test_anchored_ppo_without_anchor_keeps_the_plain_update() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("stable_baselines3")
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from ashcrown_rl.train import AnchoredPPO
+
+    model = AnchoredPPO(
+        "MlpPolicy",
+        DummyVecEnv([_TinyObsEnv]),
+        bc_coef=0.0,
+        n_steps=64,
+        batch_size=32,
+        n_epochs=2,
+        device="cpu",
+        policy_kwargs={"net_arch": [16, 16]},
+    )
+    model.learn(total_timesteps=128, progress_bar=False)
+    assert model.bc_loss == 0.0
+
+
+# --------------------------------------------------------------------------- #
 # Integration tests (real headless processes)
 # --------------------------------------------------------------------------- #
 def _train_tiny(tmp_path: Path, env_kwargs: dict[str, Any], **overrides: Any) -> dict[str, Any]:
@@ -304,6 +393,28 @@ def test_training_writes_a_checkpoint_with_matching_metadata(
     curve = (tmp_path / "curve.csv").read_text(encoding="utf-8").splitlines()
     assert curve[0].split(",") == list(CURVE_COLUMNS)
     assert len(curve) >= 2
+
+
+@pytest.mark.integration
+def test_training_with_a_bc_anchor_records_it_in_metadata(
+    env_kwargs: dict[str, Any], tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    anchor = Path(_train_tiny(tmp_path, env_kwargs)["checkpoints"][-1])
+    result = _train_tiny(
+        tmp_path / "anchored",
+        env_kwargs,
+        checkpoint_dir=tmp_path / "anchored" / "ckpt",
+        log_csv=tmp_path / "anchored" / "curve.csv",
+        bc_anchor=str(anchor),
+        bc_coef=0.5,
+        bc_steps=2,
+        save_freq=10_000,
+    )
+    metadata = read_metadata(Path(result["checkpoints"][-1]))
+    assert metadata["bc_anchor"] == str(anchor)
+    assert metadata["bc_coef"] == 0.5
+    assert metadata["bc_steps"] == 2
 
 
 @pytest.mark.integration

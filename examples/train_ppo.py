@@ -122,6 +122,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="warm-start policy weights (examples/bc_pretrain.py output)",
     )
+    parser.add_argument(
+        "--bc-anchor",
+        default=None,
+        help="reference policy for the behaviour-cloning anchor loss (a *.zip)",
+    )
+    parser.add_argument(
+        "--bc-coef",
+        type=float,
+        default=0.0,
+        help="weight of the anchor cross-entropy term (0 disables it)",
+    )
+    parser.add_argument(
+        "--bc-steps", type=int, default=1, help="anchor gradient steps per PPO update"
+    )
     parser.add_argument("--checkpoint-dir", default="runs/ppo", help="checkpoint directory")
     parser.add_argument(
         "--log-csv", default=None, help="training-curve CSV (default: dir/curve.csv)"
@@ -214,6 +228,9 @@ def main(argv: list[str] | None = None) -> int:
         algorithm=algorithm,
         hyperparameters=algorithm["hyperparameters"],
         init_checkpoint=args.init_checkpoint,
+        bc_anchor=args.bc_anchor,
+        bc_coef=args.bc_coef,
+        bc_steps=args.bc_steps,
         device=args.device,
         levels=levels,
         shaping={
