@@ -206,7 +206,10 @@ def run_episode(
             metrics.hashes.append(str(info.get("state_hash", "")))
         if metrics.game_seconds - window_start >= STUCK_WINDOW_S:
             metrics.windows += 1
-            if travel < STUCK_MIN_TRAVEL_PX and window_damage <= 0.0:
+            if "stuck" in info:
+                # The engine's own 2 s window (docs/07 §5.7).
+                metrics.stuck_windows += 1 if bool(info["stuck"]) else 0
+            elif travel < STUCK_MIN_TRAVEL_PX and window_damage <= 0.0:
                 metrics.stuck_windows += 1
             travel = 0.0
             window_damage = 0.0
