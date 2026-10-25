@@ -93,11 +93,11 @@ design is `docs/07-rl-headless-env-spec.md` in the game repository.
 ```python
 from ashcrown_rl.launch import GodotProcess
 
-with GodotProcess() as process:          # launches godot, waits for RL_READY
-    client = process.connect()           # verifies protocol/obs schema/layout hash
+with GodotProcess() as process:  # launches godot, waits for RL_READY
+    client = process.connect()  # verifies protocol/obs schema/layout hash
     obs, info = client.reset(seed=20260101)
     obs, reward, terminated, truncated, info = client.step(move=2, attack=1)
-    client.close()                       # engine exits 0, no zombie
+    client.close()  # engine exits 0, no zombie
 ```
 
 ```bash

@@ -120,6 +120,7 @@ class LaunchConfig:
     seed: int | None = None
     extra_args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
+    scene_override_fallback: bool = True
 
     def resolved_project(self) -> Path:
         """The game checkout, or raise :class:`GodotUnavailable`."""
@@ -146,13 +147,22 @@ class LaunchConfig:
         args.extend(self.extra_args)
         return args
 
-    def build_command(self) -> list[str]:
-        """The exact argv the launcher runs."""
+    def build_command(self, *, use_scene_override: bool = False) -> list[str]:
+        """The exact argv the launcher runs.
+
+        Official export templates are built with path overrides disabled, so an
+        exported binary refuses the positional scene path (``docs/07`` §3.2
+        assumes a template that allows it). ``use_scene_override`` drops the
+        positional scene and relies on an ``override.cfg`` next to the binary
+        that points ``run/main_scene`` at the RL scene instead.
+        """
         if self.exported_binary is not None:
             binary = Path(self.exported_binary).expanduser()
             if not binary.is_file():
                 raise GodotUnavailable(f"exported binary '{binary}' does not exist")
-            head = [str(binary), *ENGINE_FLAGS, self.scene]
+            head = [str(binary), *ENGINE_FLAGS]
+            if not use_scene_override:
+                head.append(self.scene)
         else:
             godot = find_godot(self.godot_bin)
             if godot is None:
@@ -193,6 +203,8 @@ class GodotProcess:
         self._stderr: collections.deque[str] = collections.deque(maxlen=LOG_TAIL_LINES)
         self._readers: list[threading.Thread] = []
         self._temporary_port_file: Path | None = None
+        self._override_file: Path | None = None
+        self._override_backup: bytes | None = None
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> GodotProcess:
@@ -205,23 +217,15 @@ class GodotProcess:
             os.unlink(path)  # the server creates it atomically; never reuse a stale file
             self._temporary_port_file = Path(path)
             self.config = dataclasses.replace(self.config, port_file=self._temporary_port_file)
-        self.command = tuple(self.config.build_command())
-        environment = dict(os.environ)
-        environment.update(self.config.env)
+        self._spawn(use_scene_override=False)
         try:
-            self._process = subprocess.Popen(
-                list(self.command),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env=environment,
-            )
-        except OSError as exc:
-            raise GodotProcessError(f"could not launch godot: {exc}", command=self.command) from exc
-        self._start_readers()
-        self._ready = self._wait_ready()
+            self._ready = self._wait_ready()
+        except GodotProcessError as exc:
+            if not self._can_retry_with_scene_override(exc):
+                raise
+            self._write_scene_override()
+            self._spawn(use_scene_override=True)
+            self._ready = self._wait_ready()
         return self
 
     def connect(self, timeout: float | None = None) -> AshCrownClient:
@@ -262,6 +266,7 @@ class GodotProcess:
         for reader in self._readers:
             reader.join(timeout=1)
         self._readers.clear()
+        self._restore_scene_override()
         port_file = self.config.port_file
         if port_file is not None:
             Path(port_file).unlink(missing_ok=True)
@@ -272,6 +277,20 @@ class GodotProcess:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+    def _restore_scene_override(self) -> None:
+        """Undo :meth:`_write_scene_override` (remove the file or restore it)."""
+        path = self._override_file
+        if path is None:
+            return
+        try:
+            if self._override_backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(self._override_backup)
+        finally:
+            self._override_file = None
+            self._override_backup = None
 
     # -- introspection ------------------------------------------------------ #
     @property
@@ -301,6 +320,52 @@ class GodotProcess:
         return self._process.wait(timeout=timeout)
 
     # -- internals ---------------------------------------------------------- #
+    def _spawn(self, *, use_scene_override: bool) -> None:
+        """Start the engine process with the resolved argv."""
+        self._process = None
+        self._readers = []
+        self.command = tuple(self.config.build_command(use_scene_override=use_scene_override))
+        environment = dict(os.environ)
+        environment.update(self.config.env)
+        try:
+            self._process = subprocess.Popen(
+                list(self.command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=environment,
+            )
+        except OSError as exc:
+            raise GodotProcessError(f"could not launch godot: {exc}", command=self.command) from exc
+        self._start_readers()
+
+    def _can_retry_with_scene_override(self, error: GodotProcessError) -> bool:
+        """True when the export template refuses a positional scene path."""
+        return (
+            self.config.scene_override_fallback
+            and self.config.exported_binary is not None
+            and self._override_file is None
+            and "path overrides" in error.stderr_tail
+        )
+
+    def _write_scene_override(self) -> None:
+        """Point the exported project's main scene at the RL scene.
+
+        The file lives next to the exported binary (Godot only reads
+        ``override.cfg`` from the project directory). An existing file is
+        backed up and restored by :meth:`close`.
+        """
+        binary = Path(self.config.exported_binary or "")
+        path = binary.expanduser().resolve().parent / "override.cfg"
+        try:
+            self._override_backup = path.read_bytes()
+        except FileNotFoundError:
+            self._override_backup = None
+        path.write_text(f'[application]\nrun/main_scene="{self.config.scene}"\n', encoding="utf-8")
+        self._override_file = path
+
     def _start_readers(self) -> None:
         process = self._process
         assert process is not None
