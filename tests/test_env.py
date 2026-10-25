@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
 
+from ashcrown_rl.baseline import HeuristicPolicy
 from ashcrown_rl.env import (
     DEFAULT_LEVEL_MAX_TICKS,
     DEFAULT_RUN_MAX_TICKS,
@@ -518,6 +519,37 @@ def test_live_run_mode_reports_level_progression_metadata(env_kwargs: dict[str, 
         assert info["terminal_reason"] == "truncated"
         assert set(levels) == {1}, "no descend happens without clearing the floor"
         assert info["mode"] == "run"
+    finally:
+        env.close()
+
+
+@pytest.mark.integration
+def test_live_run_mode_descends_over_the_bridge(env_kwargs: dict[str, Any]) -> None:
+    """Clear level 1 with the heuristic and watch the bridge follow the descend.
+
+    This is the TCP-side run-mode transition test (``docs/07`` §4.1): ``reset``
+    with ``mode="run"``, step through the real action space until ``info``
+    reports level 2, and check the run state carried over (kills/gold) and that
+    the observation's ``level``/``mode_run`` features followed the floor.
+    """
+    env = AshCrownEnv(mode="run", **env_kwargs)
+    try:
+        policy = HeuristicPolicy(env.layout)
+        obs, info = env.reset(seed=20260101)
+        assert info["level"] == 1
+        levels = {1}
+        for _ in range(1400):
+            obs, _, terminated, truncated, info = env.step(policy(obs, info, env.layout))
+            assert env.observation_space.contains(obs)
+            levels.add(int(info["level"]))
+            if int(info["level"]) >= 2 or terminated or truncated:
+                break
+        assert 2 in levels, f"the bridge never reported the descend (levels={sorted(levels)})"
+        assert not (terminated or truncated), "level 2 was entered, not a terminal"
+        assert info["kills"] > 0, "kills carried over from level 1"
+        assert env.layout.level(obs) == int(info["level"])
+        assert env.layout.value(obs, "global", "mode_run") >= 0.5
+        assert env.layout.value(obs, "global", "portal_active") < 0.5, "a fresh floor"
     finally:
         env.close()
 

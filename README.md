@@ -108,11 +108,11 @@ descent in one episode (`docs/07` §4.1):
 
 ```python
 env = AshCrownEnv(mode="run", merchant_policy="auto_heal", frame_skip=4)
-obs, info = env.reset(seed=20260101)   # level 1, auto_descend on
+obs, info = env.reset(seed=20260101)  # level 1, auto_descend on
 while not env.episode_done:
     obs, reward, terminated, truncated, info = env.step(policy(obs, info, env.layout))
-    info["level"]           # 1..10, follows the descent
-    info["gold"]            # carried across floors (same RunState)
+    info["level"]  # 1..10, follows the descent
+    info["gold"]  # carried across floors (same RunState)
 print(info["terminal_reason"])  # "victory" | "death" | "run_died" | "truncated"
 env.close()
 ```
