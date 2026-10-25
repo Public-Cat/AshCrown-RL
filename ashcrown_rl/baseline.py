@@ -1,25 +1,42 @@
 """Scripted heuristic baseline for ``ashcrown-obs-v1`` (RL-4, ``docs/07`` §9.4).
 
-The policy is a **pure function of the observation** (:func:`heuristic_action`),
-so it can be unit-tested without a Godot process and replayed exactly:
+The decision core is a **pure function of the observation**
+(:func:`heuristic_action`), so it can be unit-tested without a Godot process and
+replayed exactly; the only state lives in :class:`HeuristicPolicy` (a global
+navigation map plus two short-lived memories).
 
-1. **Fight.** Hunt the nearest perceived enemy: walk to it with a BFS path over
-   the local terrain grid, swing from just outside its reach, back off while it
-   telegraphs and strike during its recovery. With two or more enemies adjacent
-   (or at low HP with company) it disengages first instead of trading blows.
-2. **Portal.** Once the floor is cleared, path to the portal and pulse
+The policy is built on the *measured* combat economics of level 1
+(``scripts/trace_episode.py``, ``docs/artifacts/RL/RL4-report.md`` §"round 3"):
+
+* a committed swing lands on ~100-128 % of the swings started inside 0-70 px, so
+  the earlier belief that "only 10 % of swings land" was a measurement artifact
+  (hits divided by *attack requests*, not by started swings);
+* a landed hit staggers the enemy for 0.25 s and cancels its telegraph, so the
+  cheapest defence is hitting first — the swing's hitbox goes live ~0.32 s after
+  the start;
+* the body is locked for the whole 0.7 s swing, so a swing started inside the
+  enemy's own reach cannot be escaped before its next telegraph: the policy holds
+  a **standoff band** (~0.9 x the enemy's reach up to the player's reach + 40 px)
+  and only swings from inside it, with an exact swing-volume overlap test
+  (:func:`_swing_covers`) rather than a facing-cone guess.
+
+Layout of the file:
+
+1. **Fight** (:func:`_fight`): approach, standoff band, interrupt, dodge, retreat
+   through a doorway when two attackers can land at once.
+2. **Portal** (:func:`_enter_portal`): path to the open portal and pulse
    ``interact`` inside its cell.
-3. **Explore.** While the floor is not cleared and nothing is perceived, walk
-   the local-grid frontier: BFS to the nearest ``visited == 0`` floor cell
-   (tie-broken toward the portal side). When the whole 21x21 window is explored
-   the target falls outside the window, so the policy follows the portal
-   bearing instead — the portal sits on the far side of the floor, so that
-   route sweeps the map's long axis.
+3. **Explore** (:func:`_explore_step`): the nearest unvisited cell of the local
+   window, then the caller's hint, and never standing on the inactive portal.
+4. **Global navigation** (:class:`~ashcrown_rl.navmap.NavMap`): the 21x21 window
+   cannot path to a goal behind a wall it does not see, so the wrapper keeps a
+   portal-relative map of what it has seen and routes long approaches through it
+   (route memory keeps walking to a target that slipped out of perception).
 
 Every tie-break is a fixed action-index/dict order and no RNG is used, so the
 same observation always yields the same action. Acceptance (``docs/07`` §9.4):
 clears level 1 on at least 8 of 10 fixed seeds with the warrior inside the
-5-game-minute limit.
+5-game-minute limit — **currently 4/10**, see the report for the measured gap.
 """
 
 from __future__ import annotations
@@ -31,6 +48,7 @@ from typing import Any
 
 import numpy as np
 
+from .navmap import NavMap
 from .spaces import (
     PX_PER_CELL,
     EnemySlot,
@@ -46,25 +64,53 @@ from .spaces import (
 class HeuristicConfig:
     """Full configuration of the scripted baseline (immutable, hashable)."""
 
-    #: Extra pixels on the player's weapon reach before it swings (hurtbox).
-    attack_slack_px: float = 26.0
-    #: Hard cap on the swing start distance: the swing is committed, so a start
-    #: beyond the box's real coverage only locks the player in place.
-    max_attack_px: float = 69.0
-    #: Extra pixels on the enemy's reach that count as "dangerously close".
-    retreat_slack_px: float = 34.0
-    #: Minimum ``dot(facing, to_enemy)`` before swinging (the swing locks facing).
-    facing_cos: float = 0.8
-    #: Swing only from at least this distance (``0`` = swing at any range).
-    min_attack_px: float = 60.0
-    #: Post-swing cooldown (seconds) that makes a close-range swing safe.
-    safe_cooldown_s: float = 0.3
-    #: Enemies inside this radius are "adjacent" (they can pile on together).
-    group_radius_px: float = 300.0
-    #: Wounded enough that a mob cannot be out-traded → disengage instead.
-    disengage_hp_frac: float = 0.35
+    #: Extra pixels on the player's weapon reach that still land a hit.
+    #: Measured on level 1 (``scripts/trace_episode.py``): every swing started
+    #: inside 0-70 px landed (>= 100 % of the per-swing land rate), so the
+    #: strike gate is reach + this margin rather than the old 60-69 px window.
+    strike_margin_px: float = 20.0
+    #: Extra pixels on the enemy's reach that make a position dangerous. The
+    #: enemy's swing volume reaches its ``attack_reach_px`` from its feet and the
+    #: player's hurtbox adds ~22 px, so its threat radius is reach + ~22. The
+    #: measured best is deliberately *tighter* than that (12): treating the full
+    #: geometric envelope as danger made the policy dodge hits that were never
+    #: going to land and it stopped killing (1 clear / 7 deaths at slack 26,
+    #: 5 clears / 4 deaths at slack 12).
+    keepout_slack_px: float = 12.0
+    #: Seconds between a swing start and its hitbox going live (0.375 x the
+    #: warrior's 0.7 s swing); a telegraph is only interruptible beyond this.
+    swing_land_s: float = 0.32
+    #: Windup assumed when a chasing enemy could start one this window.
+    assumed_windup_s: float = 0.35
+    #: Standoff band: swing only from at least this fraction of the enemy's own
+    #: reach (a point-blank swing cannot be escaped before the next telegraph).
+    standoff_frac: float = 0.92
+    #: Lower bound of the standoff band, in pixels.
+    standoff_min_px: float = 30.0
+    #: Enemies inside this radius count as the pack that can pile on.
+    pack_radius_px: float = 105.0
+    #: With a pack on top of the body, retreat *through the nearest doorway*
+    #: instead of straight away from the pack: a 2-cell doorway funnels the
+    #: enemies into one at a time, which is the only way a 3v1 is survivable.
+    doorway_retreat: bool = True
     #: Portal distance (iso cells) at which ``interact`` is pulsed.
     portal_interact_cells: float = 0.7
+    #: Under this distance the local window handles the approach itself; above
+    #: it the wrapper's global map picks the route (the enemy can be behind a
+    #: wall the local window cannot path around).
+    local_approach_px: float = 260.0
+    #: Portal distance (iso cells) under which the pure core must walk away
+    #: from the portal instead of standing on it.
+    explore_fallback_cells: float = 7.5
+    #: Decisions the wrapper keeps walking to the last perceived enemy's cell
+    #: after it drops out of perception (route memory).
+    goal_memory_decisions: int = 90
+    #: Two or more enemies inside this radius get a short sidestep instead of a
+    #: swing: measured best at 60 px for ``pack_sidestep_decisions`` = 1 (a
+    #: longer commitment was worse — it turned fights into a 200-decision kite).
+    pack_sidestep_px: float = 60.0
+    #: Decisions a pack sidestep is held for.
+    pack_sidestep_decisions: int = 2
 
 
 DEFAULT_CONFIG = HeuristicConfig()
@@ -75,12 +121,19 @@ def heuristic_action(
     info: Mapping[str, Any] | None = None,
     layout: Layout | None = None,
     config: HeuristicConfig = DEFAULT_CONFIG,
+    explore_target: Sequence[float] | None = None,
 ) -> np.ndarray:
     """Return ``[move, attack, interact]`` for one observation.
 
     ``layout`` is the parsed handshake layout (``env.layout``). When omitted it
     is taken from ``info["layout"]`` (a :class:`Layout`, or a raw handshake
     ``layout`` mapping), so the function also works in a process-free test.
+
+    ``explore_target`` is an optional grid-cell delta (target − player) that the
+    caller's *stateful* sweep wants the body to walk to. It is only consulted
+    when the local window has no unvisited cell left — the local frontier always
+    wins — so the pure function stays a function of the observation plus that
+    one explicit hint (the same contract as ``info["action"]``).
     """
     resolved = _resolve_layout(info, layout)
     player = resolved.player_features(obs)
@@ -100,7 +153,7 @@ def heuristic_action(
     portal = resolved.portal(obs)
     if portal.active:
         return _enter_portal(resolved, grid, portal, previous, config)
-    return _action(_explore_step(resolved, grid, portal, previous), 0, 0)
+    return _action(_explore_step(resolved, grid, portal, previous, config, explore_target), 0, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -116,88 +169,185 @@ def _fight(
 ) -> np.ndarray:
     """Approach, strike and dodge the perceived enemies (``docs/07`` §9.4).
 
-    ``enemies`` is nearest-first. The duel is a three-beat loop: close to just
-    inside the player's reach, swing while the enemy cannot answer (recovering,
-    staggered or still on its post-swing cooldown), and step out while it is
-    winding up. The **nearest wounded** enemy is the focus target — spreading
-    damage over a pack leaves three enemies hitting as hard as three healthy
-    ones — and a mob is only dodged as a group while the player is too hurt to
-    trade.
+    ``enemies`` is nearest-first. Every rule below comes from the *measured*
+    level-1 combat economics (``scripts/trace_episode.py`` and the
+    ``docs/artifacts/RL/baseline_level1*.csv`` artifact):
+
+    * a swing started inside ~63 px lands (~100-128 % of started swings), so the
+      strike gate is the player's own reach, not the old "stand at 60-69 px"
+      rule;
+    * a landed hit *staggers* the enemy for 0.25 s and cancels its telegraph, so
+      hitting first is the cheapest defence;
+    * the swing's hitbox goes live ~0.32 s after the start and the body is
+      **locked for 0.7 s**, while an enemy telegraph is 0.35 s + a 0.3 s active
+      window. A swing from *point blank* therefore cannot be escaped before the
+      enemy's next telegraph lands — measured as ~10 hits taken in 20 s on the
+      seeds that died. So the body holds a **standoff band** (≈0.9 x the enemy's
+      reach up to the player's own) and only swings from inside it.
+
+    Decision order (a small deterministic state machine):
+
+    1. a committed swing is left alone (and never queued);
+    2. two enemies that can both land a hit within ``swing_land_s`` → disengage
+       (through a doorway when one is close enough to be worth it);
+    3. too close for a safe swing → back out to the band;
+    4. inside the standoff band with the swing volume covering the target and
+       our hit landing first → swing (the hit staggers the telegraph away);
+    5. a telegraph that lands before our swing can → step out of its reach;
+    6. inside the band but the swing would miss → one step to turn onto it;
+    7. otherwise close on a BFS path.
     """
-    close = [slot for slot in enemies if slot.screen_distance_px <= config.group_radius_px]
-    focus = close or [enemies[0]]
-    enemy = min(focus, key=lambda slot: (round(slot.hp_frac, 3), slot.screen_distance_px))
-    outnumbered = len(close) >= 2
-    if outnumbered and player.hp_frac <= config.disengage_hp_frac:
-        # Wounded and surrounded: back out of the group and let it string out
-        # instead of feeding the whole pack one hit at a time.
-        escape = _retreat_step(layout, grid, _centroid_screen(close), previous)
-        if escape is not None:
-            return _action(escape, 0, 0)
-
-    if len(close) < 2:
-        # One enemy: the duel dance (dodge the telegraph, strike the recovery).
-        threat = _incoming_threat(enemies, config)
-        if threat is not None:
-            escape = _retreat_step(layout, grid, screen_delta(threat.rel_cells), previous)
-            if escape is not None:
-                return _action(escape, 0, 0)
-            # Cornered: swing back rather than stand in the telegraph.
-            return _action(0, 1, 0)
-
-    screen = screen_delta(enemy.rel_cells)
-    distance_px = float(np.hypot(*screen)) * PX_PER_CELL
-    toward = _steer(layout, screen, previous)
-    in_reach = distance_px <= min(
-        player.attack_reach_px + config.attack_slack_px, config.max_attack_px
-    )
-
-    # A queued strike chains at the end of the current swing, which keeps the
-    # player locked in the attack state (movement is ignored there). Never
-    # queue: one pulse per swing keeps a free window for footwork.
     if player.state == "attack" or player.attack_queued:
+        # A committed swing ignores movement and a queued attack would chain a
+        # second swing back to back — always keep the free window afterwards.
         return _action(0, 0, 0)
 
-    threatened = enemy.state in ("windup", "attack") or enemy.hitbox_active
-    if threatened and distance_px <= enemy.attack_reach_px + config.retreat_slack_px:
-        if outnumbered and in_reach and _facing_aligned(player, screen, config.facing_cos):
-            # A mob leaves no gap to dodge through: retreating only bleeds HP
-            # without dealing damage, so trade inside the pack and finish one
-            # enemy at a time instead.
-            return _action(0, 1, 0)
-        escape = _retreat_step(layout, grid, screen, previous)
-        if escape is not None:
-            return _action(escape, 0, 0)
-        # Cornered: trade the hit rather than stand still (facing is current
-        # because the enemy is right in front of us).
-        return _action(toward, 1, 0)
+    focus = _focus_target(enemies, config)
+    screen = screen_delta(focus.rel_cells)
+    distance_px = float(np.hypot(*screen)) * PX_PER_CELL
 
-    if in_reach:
-        # The enemy reaches further than the player and its wind-up is shorter
-        # than a swing, so only start one from (a) outside its attack trigger
-        # range or (b) while it cannot answer: recovering, staggered or still
-        # on its post-swing cooldown. Swinging from point blank otherwise is a
-        # guaranteed trade, and 12 trades is the whole health bar.
-        safe = (
-            outnumbered
-            or enemy.state in ("recover", "stagger")
-            or enemy.attack_cooldown_s >= config.safe_cooldown_s
-        )
-        if distance_px >= config.min_attack_px or safe:
-            if _facing_aligned(player, screen, config.facing_cos):
-                return _action(0, 1, 0)
-        else:
-            escape = _retreat_step(layout, grid, screen, previous)
-            if escape is not None:
-                return _action(escape, 0, 0)
+    dangerous = [
+        slot
+        for slot in enemies
+        if slot.screen_distance_px <= slot.attack_reach_px + config.keepout_slack_px
+    ]
+    imminent = [slot for slot in dangerous if _threat_in_s(slot, config) <= config.swing_land_s]
+    in_strike = distance_px <= player.attack_reach_px + config.strike_margin_px
+    in_band = in_strike and distance_px >= _standoff_px(focus, config)
+    # Exact swing-volume test (see ``_swing_covers``): the swing locks the
+    # current facing, so this is the same test the engine will run on the
+    # hitbox's live frames.
+    covers = _swing_covers(player.facing, screen * PX_PER_CELL, player.attack_reach_px)
 
-    move = _path_step(layout, grid, enemy.rel_cells, previous)
-    if move == 0 and distance_px > 1.0:
-        # Inside half a grid cell the rounded BFS target is our own cell; steer
-        # with the exact screen direction instead (this is what turns the
-        # facing, and the swing locks the facing).
-        move = toward
+    # 1. Two hits landing on us at once: no single swing can interrupt both.
+    if len(imminent) >= 2:
+        return _retreat(layout, grid, imminent, previous, config)
+
+    # 2. Timing. Our swing lands ``swing_land_s`` after the start and the hit
+    #    staggers whatever it touches out of its telegraph, so the focus target
+    #    may be attacked as soon as our hit lands first.
+    focus_threat = _threat_in_s(focus, config)
+    if not in_band and in_strike:
+        # Point blank: back out to the band before trading (a 0.7 s lock from
+        # inside 0.9 x the enemy's reach cannot be escaped, see the docstring).
+        # Every enemy inside the pack radius counts, not just the focus: with
+        # two attackers the nearest one alternates and a single-threat flee
+        # ping-pongs between them.
+        return _retreat(layout, grid, dangerous or [focus], previous, config)
+    if in_band and covers and (focus not in dangerous or focus_threat >= config.swing_land_s):
+        return _action(0, 1, 0)
+    if focus in dangerous and focus_threat < config.swing_land_s:
+        return _retreat(layout, grid, [focus], previous, config)
+
+    # 3. Inside the band but the swing would miss: turn onto the target. The
+    #    facing only changes when the body moves, so this is one 45-degree step
+    #    toward it — no hysteresis, the swing comes next window.
+    if in_band:
+        step = layout.move_index(screen)
+        if not _step_is_free(layout, grid, layout.actions[step].grid):
+            step = _steer(layout, screen, previous)
+        return _action(step, 0, 0)
+
+    # 4. Close the distance on a BFS path (walls, doorways, props).
+    move = _path_step(layout, grid, focus.rel_cells, previous)
+    if move == 0:
+        # Inside half a cell the rounded BFS target is our own cell; steer with
+        # the exact screen direction instead.
+        move = _steer(layout, screen, previous)
     return _action(move, 0, 0)
+
+
+def _retreat(
+    layout: Layout,
+    grid: np.ndarray,
+    threats: Sequence[EnemySlot],
+    previous: int,
+    config: HeuristicConfig = DEFAULT_CONFIG,
+) -> np.ndarray:
+    """Step out of every threat at once; hold only when there is no way out.
+
+    With two or more attackers the retreat is routed **through the nearest
+    doorway** when that doorway is farther from the pack than the body already
+    is: a 2-cell doorway funnels a pack into one attacker at a time, while a
+    plain "away from the centroid" step in a room walks into the far wall and
+    the pack converges (the measured 3v1 death: 10 hits in 12 s with one swing).
+    """
+    if config.doorway_retreat and len(threats) >= 2:
+        step = _doorway_step(layout, grid, threats, previous)
+        if step is not None:
+            return _action(step, 0, 0)
+    screens = [screen_delta(slot.rel_cells) for slot in threats]
+    escape = _flee_step(layout, grid, screens, previous)
+    if escape is not None:
+        return _action(escape, 0, 0)
+    return _action(0, 0, 0)
+
+
+def _doorway_step(
+    layout: Layout,
+    grid: np.ndarray,
+    threats: Sequence[EnemySlot],
+    previous: int,
+) -> int | None:
+    """First BFS step to a doorway that is farther from the pack than we are."""
+    centroid = _centroid_screen(threats)
+    here = float(np.hypot(*centroid))
+    paths = _bfs(layout, grid)
+    doors = [
+        (cell, path)
+        for cell, path in paths.items()
+        if cell != (0, 0) and layout.cell(grid, cell[0], cell[1], "doorway") > 0.5
+    ]
+    if not doors:
+        return None
+    cell, path = min(
+        doors,
+        key=lambda item: (item[1][1], item[0][0], item[0][1]),
+    )
+    if float(np.hypot(*(screen_delta(cell) - centroid))) <= here:
+        return None
+    return _no_reversal(path[0], previous, layout, grid)
+
+
+def _standoff_px(enemy: EnemySlot, config: HeuristicConfig) -> float:
+    """Closest distance a safe swing may start from this enemy.
+
+    A swing from closer than this cannot be escaped before the enemy's *next*
+    telegraph goes live (0.7 s lock + 0.35 s windup versus a 0.4 s recovery), so
+    the band starts just inside the enemy's own reach.
+    """
+    return max(config.standoff_frac * enemy.attack_reach_px, config.standoff_min_px)
+
+
+def _focus_target(enemies: Sequence[EnemySlot], config: HeuristicConfig) -> EnemySlot:
+    """The enemy to kill next: the nearest wounded one, else the nearest.
+
+    Focus fire finishes a target instead of spreading damage over the pack
+    (three wounded enemies hit exactly as hard as three healthy ones). Wounded
+    means "already below full HP" and only among enemies that are close enough
+    to be worth walking to; the nearest living enemy is the fallback.
+    """
+    reachable = [slot for slot in enemies if slot.screen_distance_px <= config.pack_radius_px * 4.0]
+    pool = reachable or list(enemies)
+    wounded = [slot for slot in pool if slot.hp_frac < 0.999]
+    return min(wounded or pool, key=lambda slot: (slot.screen_distance_px, slot.slot))
+
+
+def _threat_in_s(enemy: EnemySlot, config: HeuristicConfig) -> float:
+    """Seconds until this enemy's swing can damage the player (lower = sooner).
+
+    A chasing enemy has to reach its trigger range and wind up first, so it is
+    never an *immediate* threat; a telegraph is one ``windup_remaining`` away;
+    an active swing is live now; a recovering or staggered enemy cannot answer
+    at all this window.
+    """
+    if enemy.hitbox_active or enemy.state == "attack":
+        return 0.0
+    if enemy.state == "windup":
+        return max(enemy.windup_remaining_s, 0.0)
+    if enemy.state in ("recover", "stagger", "dead"):
+        return _NO_THREAT_S
+    return max(config.assumed_windup_s, enemy.attack_cooldown_s)
 
 
 def _enter_portal(
@@ -222,19 +372,32 @@ def _enter_portal(
 
 
 def _explore_step(
-    layout: Layout, grid: np.ndarray, portal: PortalFeatures, previous: int = 0
+    layout: Layout,
+    grid: np.ndarray,
+    portal: PortalFeatures,
+    previous: int = 0,
+    config: HeuristicConfig = DEFAULT_CONFIG,
+    explore_target: Sequence[float] | None = None,
 ) -> int:
     """BFS first step to the nearest unexplored floor cell of the local window.
 
     The env marks a 3x3 brush around the player as ``visited``, so the nearest
     unvisited cell is always just outside the brush and the walk sweeps the
     floor systematically. Ties (the eight cells of the same BFS ring) go to the
-    cell closest to the portal: the exit sits on the far side of the floor, so
-    the sweep leans across the map instead of orbiting the room it started in.
+    cell closest to the sweep target: the exit sits on the far side of the
+    floor, so the sweep leans across the map instead of orbiting the room it
+    started in.
 
     When the whole window is explored there is no frontier left and the target
-    is outside the 21x21 window, so the portal bearing takes over — that is the
-    long-range fallback the spec asks for (§5.7).
+    is outside the 21x21 window. Then, in order:
+
+    1. the caller's ``explore_target`` (the stateful sweep's next waypoint);
+    2. the portal bearing — the spec'd long-range fallback (§5.7);
+    3. **away from the portal**, when the body is already standing next to it.
+       That last case is what stalled seeds 1/2/3/6: the portal is *inactive*
+       but its cell is inside the window, the clamped bearing rounds to the
+       player's own cell, and the policy stood still for the rest of the
+       episode (measured: 3,421 of 4,500 decisions on seed 2).
     """
     paths = _bfs(layout, grid)
     frontier = [
@@ -242,22 +405,31 @@ def _explore_step(
         for cell, path in paths.items()
         if cell != (0, 0) and layout.visited(grid, cell[0], cell[1]) < 0.5
     ]
-    if not frontier:
+    if frontier:
+        reference = (
+            (float(explore_target[0]), float(explore_target[1]))
+            if explore_target is not None
+            else (float(portal.rel_cells[0]), float(portal.rel_cells[1]))
+        )
+        reference_cell = (int(round(reference[0])), int(round(reference[1])))
+        _, path = min(
+            frontier,
+            key=lambda item: (
+                item[1][1],
+                round(_distance_to(item[0], reference_cell), 6),
+                item[0][0],
+                item[0][1],
+            ),
+        )
+        return _no_reversal(path[0], previous, layout, grid)
+    if explore_target is not None:
+        return _path_step(layout, grid, explore_target, previous)
+    if portal.distance_cells >= config.explore_fallback_cells:
         return _path_step(layout, grid, portal.rel_cells, previous)
-    portal_cell = (
-        int(round(float(portal.rel_cells[0]))),
-        int(round(float(portal.rel_cells[1]))),
-    )
-    _, path = min(
-        frontier,
-        key=lambda item: (
-            item[1][1],
-            round(_distance_to(item[0], portal_cell), 6),
-            item[0][0],
-            item[0][1],
-        ),
-    )
-    return _no_reversal(path[0], previous, layout, grid)
+    # Standing next to the (inactive) portal with nothing left to visit in the
+    # window: walk *away* from it, otherwise the rounded bearing is our own cell.
+    step = _flee_step(layout, grid, [screen_delta(portal.rel_cells)], previous)
+    return 0 if step is None else step
 
 
 def _path_step(
@@ -368,53 +540,109 @@ def _centroid_screen(enemies: Sequence[EnemySlot]) -> np.ndarray:
     return total / max(len(enemies), 1)
 
 
-def _incoming_threat(enemies: Sequence[EnemySlot], config: HeuristicConfig) -> EnemySlot | None:
-    """The nearest enemy whose swing is already telegraphing inside its reach."""
-    for enemy in enemies:
-        if not (enemy.state in ("windup", "attack") or enemy.hitbox_active):
-            continue
-        if enemy.screen_distance_px <= enemy.attack_reach_px + config.retreat_slack_px:
-            return enemy
-    return None
+#: Player hurtbox half-extents and vertical offset, measured from
+#: ``scenes/actors/player.tscn`` (44 x 56 at ``(0, -28)`` relative to the feet).
+PLAYER_HURTBOX_HALF = (22.0, 28.0)
+PLAYER_HURTBOX_OFFSET_Y = -28.0
+#: Enemy hurtbox (``scenes/actors/enemies/enemy.tscn``): 44 x 56 at ``(0, -22)``.
+ENEMY_HURTBOX_HALF = (22.0, 28.0)
+ENEMY_HURTBOX_OFFSET_Y = -22.0
+#: Swing rectangle width as a fraction of the reach (``Player.HITBOX_WIDTH_PER_REACH``).
+SWING_WIDTH_PER_REACH = 0.92
 
 
-def _facing_aligned(player: PlayerFeatures, screen: np.ndarray, threshold: float) -> bool:
-    """True when the player already faces the enemy (the swing locks facing)."""
-    facing = np.asarray(player.facing, dtype=np.float64)
-    if float(np.hypot(*facing)) <= 1e-6:
+def _swing_covers(facing: Sequence[float], rel_screen_px: Sequence[float], reach_px: float) -> bool:
+    """True when the current facing puts the enemy inside the swing volume.
+
+    The player's swing box is a rectangle of ``reach`` x ``0.92 * reach`` that
+    starts at the feet and points along ``facing`` (``Player._apply_hitbox_geometry``);
+    the enemy's hurtbox is an axis-aligned 44x56 rectangle centred 22 px above its
+    feet. A swing only lands when those two overlap, so this is an exact
+    separating-axis test instead of a ``dot(facing, to_enemy)`` guess — the
+    reason the earlier facing heuristic both refused hits that would have landed
+    and walked the body into point-blank range to "turn".
+    """
+    fx = float(facing[0])
+    fy = float(facing[1])
+    length = float(np.hypot(fx, fy))
+    if length <= 1e-6:
         return False
-    to_enemy = normalise(screen)
-    if float(np.hypot(*to_enemy)) <= 1e-6:
-        return True
-    return float(facing[0] * to_enemy[0] + facing[1] * to_enemy[1]) >= threshold
+    fx /= length
+    fy /= length
+    # Enemy hurtbox centre relative to the player's feet.
+    ex = float(rel_screen_px[0])
+    ey = float(rel_screen_px[1]) + ENEMY_HURTBOX_OFFSET_Y
+    half_length = reach_px * 0.5
+    half_width = reach_px * SWING_WIDTH_PER_REACH * 0.5
+    # Swing rect centre: half the reach along the facing.
+    cx = fx * half_length
+    cy = fy * half_length
+    # Axis-aligned hurtbox axes first.
+    dx = ex - cx
+    dy = ey - cy
+    if abs(dx) > PLAYER_HURTBOX_HALF[0] + abs(fx) * half_length + abs(fy) * half_width:
+        return False
+    if abs(dy) > PLAYER_HURTBOX_HALF[1] + abs(fy) * half_length + abs(fx) * half_width:
+        return False
+    # Then the swing rect's own axes (forward and perpendicular).
+    forward = dx * fx + dy * fy
+    if abs(forward) > half_length + PLAYER_HURTBOX_HALF[0] * abs(fx) + PLAYER_HURTBOX_HALF[1] * abs(
+        fy
+    ):
+        return False
+    lateral = -dx * fy + dy * fx
+    if abs(lateral) > half_width + PLAYER_HURTBOX_HALF[0] * abs(fy) + PLAYER_HURTBOX_HALF[1] * abs(
+        fx
+    ):
+        return False
+    return True
 
 
-def _retreat_step(
+def _flee_step(
     layout: Layout,
     grid: np.ndarray,
-    threat_screen: np.ndarray,
+    threats: Sequence[Sequence[float]],
     previous: int = 0,
+    depth: int = 4,
 ) -> int | None:
-    """Walkable step away from a threat, or ``None`` when there is no escape."""
-    away = normalise(-np.asarray(threat_screen, dtype=np.float64))
+    """BFS step that opens the most distance to the nearest of ``threats``.
+
+    ``threats`` are screen-space vectors (cell units) from the player to each
+    enemy that matters. Scoring a single centroid flips direction when two
+    enemies stand on opposite sides (the measured two-enemy death spiral: the
+    body ping-ponged between two attackers for 20 s while taking every hit), so
+    the score is the distance to the *closest* threat. The iso projection is
+    linear, so a walkable cell's screen position can be compared directly.
+
+    Looking ``depth`` cells ahead is what turns the body before it runs into a
+    wall or a doorway it cannot back out of; the immediate eight axes alone
+    (the RL-4 behaviour) walk straight into the nearest corner.
+    """
+    vectors = [np.asarray(threat, dtype=np.float64) for threat in threats]
+    if not vectors:
+        return None
     best_index: int | None = None
     best_score = -np.inf
-    for spec in layout.actions:
-        if not spec.moving:
+    for cell, (first_step, distance) in _bfs(layout, grid).items():
+        if cell == (0, 0) or distance > depth:
             continue
-        if not _step_is_free(layout, grid, spec.grid):
-            continue
-        score = float(spec.screen[0] * away[0] + spec.screen[1] * away[1])
+        position = screen_delta(cell)
+        nearest = min(float(np.hypot(*(position - vector))) for vector in vectors)
+        score = nearest - 0.05 * float(distance)
         if score > best_score + _HYSTERESIS:
             best_score = score
-            best_index = spec.index
-    if best_index is not None and previous and previous != best_index:
-        # Keep the previous escape direction when it is almost as good: flipping
-        # between two adjacent axes every window moves the player nowhere.
-        spec = layout.actions[previous] if previous < len(layout.actions) else None
-        if spec is not None and spec.moving and _step_is_free(layout, grid, spec.grid):
-            kept = float(spec.screen[0] * away[0] + spec.screen[1] * away[1])
-            if kept >= best_score - _HYSTERESIS:
+            best_index = first_step
+    if best_index is None:
+        return None
+    if previous and previous != best_index and 0 < previous < len(layout.actions):
+        # "Keep walking": the away direction is noisy at point blank (and with a
+        # pack it flips between attackers), so a still-good previous axis wins.
+        # Otherwise the body oscillates across the enemy instead of leaving.
+        spec = layout.actions[previous]
+        if spec.moving and _step_is_free(layout, grid, spec.grid):
+            position = screen_delta(spec.grid)
+            nearest = min(float(np.hypot(*(position - vector))) for vector in vectors)
+            if nearest >= best_score - 2.0 * _HYSTERESIS:
                 return previous
     return best_index
 
@@ -512,6 +740,9 @@ def _bfs(layout: Layout, grid: np.ndarray) -> dict[tuple[int, int], tuple[int, i
             queue.append(nxt)
     return paths
 
+
+#: "This enemy cannot answer for a long time" (recover/stagger/dead).
+_NO_THREAT_S = 99.0
 
 _HYSTERESIS = 0.06
 #: Walked distance (cells) over the no-progress window that still counts as frozen.
@@ -632,6 +863,18 @@ class HeuristicPolicy:
     decisions, which walks the body out of the trap; if that axis is blocked in
     practice the detection fires again and it rotates on.
 
+    The second piece of state is the **exploration sweep**: once the local
+    21x21 window has no unvisited cell left, the pure core has no target and the
+    portal is the only global landmark it can see. Walking the portal bearing is
+    right when the portal is far, but once the body *stands next to the inactive
+    portal* that bearing rounds to its own cell and the policy froze (measured:
+    3,421 of 4,500 decisions on seed 2, 76 % of the episode). The wrapper
+    therefore holds a deterministic ring sweep around the portal — radii from
+    ``config.sweep_radii_cells`` in eight grid directions — and hands the current
+    waypoint to the core as ``explore_target``. It advances on arrival, on a
+    stall counter, and resets when the portal opens. The core still prefers a
+    real local frontier whenever one exists.
+
     ``__call__`` matches the evaluation/replay policy signature
     ``(obs, info, layout)``; the layout is taken from the constructor.
     """
@@ -661,16 +904,28 @@ class HeuristicPolicy:
         self._flat: deque[float] = deque(maxlen=self.no_progress_windows)
         self._escape_left = 0
         self._escape_move = 0
+        self._goal: tuple[int, int] | None = None
+        self._goal_age = 0
+        self._explore_goal: tuple[int, int] | None = None
+        self._explore_age = 0
+        self._sidestep_left = 0
+        self._sidestep_move = 0
+        self.map = NavMap(layout)
 
     def __call__(
         self, obs: np.ndarray, info: Mapping[str, Any] | None = None, layout: Layout | None = None
     ) -> np.ndarray:
         resolved = layout or self.layout
         action = heuristic_action(obs, info, resolved, self.config)
+        navigation = self._nav_move(resolved, obs, info)
+        if navigation:
+            action = action.copy()
+            action[0] = navigation
+        action = self._pack_sidestep(resolved, obs, action)
         player = resolved.player_features(obs)
         grid = resolved.grid(obs)
         engaged = any(
-            slot.screen_distance_px <= self.config.group_radius_px
+            slot.screen_distance_px <= self.config.pack_radius_px
             for slot in resolved.perceived_enemies(obs)
         )
         self._track(info, player.cell_fraction)
@@ -692,6 +947,123 @@ class HeuristicPolicy:
                 action[0] = self._escape_move
             else:
                 self._escape_left = 0
+        return action
+
+    # -- global navigation -------------------------------------------------- #
+    def _nav_move(
+        self,
+        layout: Layout,
+        obs: np.ndarray,
+        info: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """The global-map move for this decision, or ``None`` to keep the core's.
+
+        The local 21x21 window cannot path to a goal that sits behind a wall it
+        does not see (the measured seed-2 failure: two enemies alive, ~850 px
+        away, 233 s spent circling). :class:`~ashcrown_rl.navmap.NavMap` keeps
+        the whole walkable raster in portal-relative cells and answers with the
+        first grid step instead. Combat inside ``local_approach_px`` and the
+        hazard dodge stay with the pure core; a live telegraph under the body is
+        always the core's call.
+        """
+        grid = layout.grid(obs)
+        if layout.hazard(grid, 0, 0) >= 0.5:
+            return None
+        portal = layout.portal(obs)
+        offset = info.get("player_cell_offset") if isinstance(info, Mapping) else None
+        offset = _offset_vector(offset)
+        self.map.update(grid, portal, tuple(offset) if offset is not None else (0.0, 0.0))
+        enemies = [slot for slot in layout.perceived_enemies(obs) if not slot.dead]
+        if enemies:
+            focus = min(enemies, key=lambda slot: (slot.screen_distance_px, slot.slot))
+            if focus.screen_distance_px <= self.config.local_approach_px:
+                self._goal = None
+                return None
+            self._goal = (
+                self.map.player[0] + int(round(focus.rel_cells[0])),
+                self.map.player[1] + int(round(focus.rel_cells[1])),
+            )
+            self._goal_age = 0
+            step = self.map.step_towards(self._goal)
+        elif portal.active:
+            self._goal = None
+            step = self.map.step_towards(self.map.portal)
+        elif self._goal is not None and self._goal_age < self.config.goal_memory_decisions:
+            # The enemy is right at the 900 px perception edge: the map route to
+            # it often leaves the room *away* from it first, which drops it out
+            # of perception and made the policy flip between "approach" and
+            # "explore" for 4,000 decisions (measured on seed 5: 5 kills, then
+            # nothing for 273 s). Remember the last goal and keep walking to it.
+            self._goal_age += 1
+            step = self.map.step_towards(self._goal)
+        else:
+            self._goal = None
+            step = self.map.explore_step(self._explore_target())
+            if step is None:
+                return None
+        if step is None:
+            return None
+        return layout.move_for_grid_step(step)
+
+    def _explore_target(self) -> tuple[int, int] | None:
+        """The committed exploration destination (kept for a bounded time).
+
+        ``NavMap.explore_step`` re-derives "walk deeper" every window, and with
+        two equally far ends of the known area the choice flips and the body
+        oscillates between them — the measured seed-3 stall (9 kills, then 233 s
+        of walking with 0 damage and no new cells). Holding one destination for
+        ``goal_memory_decisions`` windows (and dropping it on arrival) makes the
+        walk monotone, which is what actually unfolds the map.
+        """
+        if self._explore_goal is not None and self._explore_age < self.config.goal_memory_decisions:
+            self._explore_age += 1
+            if self.map.step_towards(self._explore_goal) is not None:
+                return self._explore_goal
+        self._explore_goal = self.map.deepest_cell()
+        self._explore_age = 0
+        return self._explore_goal
+
+    # -- pack sidestep ------------------------------------------------------ #
+    def _pack_sidestep(self, layout: Layout, obs: np.ndarray, action: np.ndarray) -> np.ndarray:
+        """Take one escape step when two enemies are already on top of the body.
+
+        This is the one surviving piece of pack footwork that measured *better*
+        than plain trading: with two attackers inside ``pack_sidestep_px`` the
+        next swing is a guaranteed double trade, so a single step out (then the
+        normal combat rules) keeps the pair from stacking perfectly on top of the
+        body. Longer commitments (3-9 decisions) were measured worse: they turn
+        the fight into a kite that never kills anything.
+        """
+        if int(action[1]) == 1:
+            self._sidestep_left = 0
+            return action
+        if self._sidestep_left > 0:
+            self._sidestep_left -= 1
+            spec = layout.actions[self._sidestep_move] if self._sidestep_move else None
+            if (
+                spec is not None
+                and spec.moving
+                and _step_is_free(layout, layout.grid(obs), spec.grid)
+            ):
+                action = action.copy()
+                action[0] = self._sidestep_move
+            return action
+        enemies = [slot for slot in layout.perceived_enemies(obs) if not slot.dead]
+        if len(enemies) < 2:
+            return action
+        close = [
+            slot for slot in enemies if slot.screen_distance_px <= self.config.pack_sidestep_px
+        ]
+        if len(close) < 2:
+            return action
+        grid = layout.grid(obs)
+        move = _flee_step(layout, grid, [screen_delta(slot.rel_cells) for slot in close], 0)
+        if not move:
+            return action
+        self._sidestep_move = move
+        self._sidestep_left = max(self.config.pack_sidestep_decisions, 1) - 1
+        action = action.copy()
+        action[0] = move
         return action
 
     # -- pocket detection --------------------------------------------------- #

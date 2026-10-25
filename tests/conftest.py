@@ -95,6 +95,8 @@ class ObservationBuilder:
         kind: str = "skeleton_normal",
         attack_reach_px: float = 50.0,
         cooldown_s: float = 0.0,
+        windup_s: float = 0.0,
+        hitbox_active: bool = False,
     ) -> ObservationBuilder:
         block = self.layout.block("enemies")
         base = block.offset + slot * block.shape[1]
@@ -117,6 +119,8 @@ class ObservationBuilder:
             row[index[state_key]] = 1.0
         row[index["attack_reach"]] = attack_reach_px / 200.0
         row[index["attack_cooldown"]] = cooldown_s / 5.0
+        row[index["windup_remaining"]] = windup_s / 3.0
+        row[index["attack_hitbox_active"]] = 1.0 if hitbox_active else 0.0
         self.obs[base : base + block.shape[1]] = row
         return self
 
