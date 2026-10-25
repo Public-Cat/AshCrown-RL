@@ -112,8 +112,11 @@ def collect(
         obs, infos = vec.reset()
         collected = 0
         while collected < int(steps):
-            actions_batch = _label_batch(policies, obs, infos, int(n_envs))
-            observations.append(_raw_frame(obs))
+            # The demonstrator reads the *raw* frame (single-frame layout); only
+            # the stored/gathered observation carries the history.
+            raw = _raw_frame(obs)
+            actions_batch = _label_batch(policies, raw, infos, int(n_envs))
+            observations.append(raw)
             actions.append(actions_batch)
             episodes.append(counters.copy())
             collected += int(n_envs)
@@ -194,7 +197,8 @@ def collect_dagger(
         obs, infos = vec.reset()
         collected = 0
         while collected < int(steps):
-            labels = _label_batch(policies, obs, infos, int(n_envs))
+            raw = _raw_frame(obs)
+            labels = _label_batch(policies, raw, infos, int(n_envs))
             # The executed action comes from the *policy*, the label from the
             # demonstrator; only the label is learned.
             executed = np.stack(
@@ -203,7 +207,7 @@ def collect_dagger(
                     for index in range(int(n_envs))
                 ]
             ).astype(np.int64)
-            observations.append(_raw_frame(obs))
+            observations.append(raw)
             actions.append(labels)
             episodes.append(counters.copy())
             collected += int(n_envs)
@@ -309,10 +313,9 @@ def fit(
         total = 0.0
         for start in range(0, count, int(batch_size)):
             batch = order[start : start + int(batch_size)]
-            if stack_index is not None:
-                window = stack_index[batch].reshape(-1)
-            else:
-                window = batch
+            # (B, k, obs_len) — the flattening extractor turns each row into
+            # k x obs_len inputs, exactly as the training vector env does.
+            window = stack_index[batch] if stack_index is not None else batch
             heads = model.policy.get_distribution(obs_tensor[window]).distribution
             losses = []
             for index, head in enumerate(heads):
