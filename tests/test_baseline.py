@@ -1,16 +1,18 @@
 """Heuristic baseline tests (RL-4, ``docs/07`` §9.4).
 
 The decision rules are unit-tested on synthetic observations built from the
-published layout (no process). The integration test is a progress smoke test on
-the real level 1: the scripted policy must convert its observation into kills.
-The full fixed-seed acceptance run (``>= 8/10`` clear rate) is measured by
-``python -m ashcrown_rl.evaluate`` and recorded in
-``docs/artifacts/RL/baseline_level1.json`` — see the RL-4 report for the
-measured result.
+published layout (no process). The ``integration`` tests drive the real level 1:
+the fixed-seed **acceptance** gate (``docs/07`` §9.4: the shipped configuration
+must clear at least 8 of the 10 fixed seeds), a progress smoke test, a
+determinism test and the seed-10 pocket regression. The acceptance test costs a
+couple of minutes; the per-seed detail behind it is the committed artifact
+``docs/artifacts/RL/baseline_level1.json`` / ``.csv``.
 """
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -34,10 +36,16 @@ from ashcrown_rl.spaces import (
     PX_PER_CELL,
     Layout,
     PortalFeatures,
+    grid_delta,
     load_fixture_layout,
     normalise,
     screen_delta,
 )
+
+#: The 10 fixed acceptance seeds (``docs/07`` §9.4).
+ACCEPTANCE_SEEDS: tuple[int, ...] = tuple(range(1, 11))
+#: Clears the shipped configuration must reach on those seeds.
+ACCEPTANCE_CLEARS = 8
 
 
 def _portal(rel_x: float, rel_y: float) -> PortalFeatures:
@@ -311,6 +319,35 @@ def test_heuristic_lands_kills_on_level_1(env_kwargs: dict[str, Any]) -> None:
 
 
 @pytest.mark.integration
+def test_acceptance_clears_eight_of_the_ten_fixed_seeds(env_kwargs: dict[str, Any]) -> None:
+    """``docs/07`` §9.4 acceptance: >= 8 of the 10 fixed seeds clear level 1.
+
+    The same protocol as the committed artifact (warrior, level 1,
+    ``frame_skip=4``, ``max_ticks=18,000``, ``DEFAULT_CONFIG``). It costs a
+    couple of minutes because it is the real gate, not a proxy: the RL-4 review
+    found the report claiming 8/10 while the suite asserted only "kills happen".
+    """
+    env = AshCrownEnv(level=1, max_ticks=18_000, **env_kwargs)
+    cleared: list[int] = []
+    reasons: dict[int, str] = {}
+    try:
+        for seed in ACCEPTANCE_SEEDS:
+            policy = HeuristicPolicy(env.layout)
+            obs, info = env.reset(seed=seed)
+            while not env.episode_done:
+                obs, _, _, _, info = env.step(policy(obs, info, env.layout))
+            reasons[seed] = str(info.get("terminal_reason", ""))
+            if reasons[seed] == "level_clear":
+                cleared.append(seed)
+    finally:
+        env.close()
+    assert len(cleared) >= ACCEPTANCE_CLEARS, (
+        f"only {len(cleared)}/{len(ACCEPTANCE_SEEDS)} fixed seeds cleared "
+        f"({cleared}); terminal reasons {reasons}"
+    )
+
+
+@pytest.mark.integration
 def test_heuristic_is_deterministic_for_a_seed(env_kwargs: dict[str, Any]) -> None:
     env = AshCrownEnv(level=1, max_ticks=600, **env_kwargs)
     try:
@@ -329,12 +366,40 @@ def test_heuristic_is_deterministic_for_a_seed(env_kwargs: dict[str, Any]) -> No
         env.close()
 
 
-def test_reach_conversion_matches_the_grid_scale(layout: Layout, make_obs) -> None:
-    """A grid step is 128 px per unit in the screen projection (sanity pin)."""
-    enemy_screen = screen_delta((1.0, 0.0))
-    assert float(np.hypot(*enemy_screen)) * PX_PER_CELL == pytest.approx(
-        1.1180339 * PX_PER_CELL, rel=1e-6
-    )
+def _engine_cell_px(project: str) -> float | None:
+    """``FloorPlan.CELL`` from the game sources, or ``None`` when unavailable."""
+    path = Path(project) / "scripts" / "levelgen" / "floor_plan.gd"
+    if not path.is_file():
+        return None
+    match = re.search(r"^const CELL:\s*float\s*=\s*([0-9.]+)", path.read_text(), re.MULTILINE)
+    return None if match is None else float(match.group(1))
+
+
+@pytest.mark.integration
+def test_reach_conversion_matches_the_engine_cell_size(env_kwargs: dict[str, Any]) -> None:
+    """``PX_PER_CELL`` is the engine's ``FloorPlan.CELL``, pinned on a live reset.
+
+    The pixel quantities the baseline reasons about (reaches, velocities) are
+    converted into grid cells with :data:`PX_PER_CELL`; the engine places cells
+    with ``FloorPlan.CELL``. The pin uses the two ``info`` keys the RL-4 follow-up
+    added (``docs/07`` §5.6): ``player_position`` converted back through
+    :func:`grid_delta` must equal ``player_cell`` shifted by the ground layer's
+    half-tile origin, in cells.
+    """
+    cell_px = _engine_cell_px(env_kwargs["project"])
+    env = AshCrownEnv(level=1, max_ticks=600, **env_kwargs)
+    try:
+        _, info = env.reset(seed=20260113)
+        cell = np.asarray(info["player_cell"], dtype=np.float64)
+        position = np.asarray(info["player_position"], dtype=np.float64)
+        assert not np.allclose(cell, 0.0), "the plan frame must be absolute"
+        if cell_px is not None:
+            assert PX_PER_CELL == pytest.approx(cell_px, rel=1e-9)
+        assert np.allclose(
+            grid_delta(position) / PX_PER_CELL, cell + np.array([1.0, 0.0]), atol=1e-3
+        ), f"player_cell {cell} disagrees with player_position {position}"
+    finally:
+        env.close()
 
 
 # --------------------------------------------------------------------------- #

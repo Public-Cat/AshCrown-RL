@@ -11,13 +11,15 @@ A replay log is a small JSON document::
      "policy": "heuristic",
      "actions": [[2, 1, 0], ...],
      "hashes": ["…", "…"],
+     "states": ["tick=4|level=1|hp=94.20|…", …],
      "rewards": [0.12, …]}
 
 :func:`replay` drives a **fresh** process with the same config/seed/actions and
 compares the per-step ``info["state_hash"]`` sequence: a bit-identical replay
 proves the determinism contract, and a mismatch names the first differing step
-(which makes the log a usable bug report). ``record`` and ``replay`` are both
-CLI-friendly::
+and carries a bounded **state diff** of that step (:func:`state_line`,
+:func:`diff_state_lines`) — the report ``docs/07`` §10.4 promises — which makes
+the log a usable bug report. ``record`` and ``replay`` are both CLI-friendly::
 
     uv run python -m ashcrown_rl.replay record --seed 7 --steps 400 --out /tmp/x.json
     uv run python -m ashcrown_rl.replay replay --file /tmp/x.json
@@ -40,18 +42,135 @@ from .spaces import Layout
 
 LOG_VERSION = 1
 
+#: Longest state line the replay log keeps per step (bounded failure report).
+MAX_STATE_CHARS = 240
+#: Longest state diff the mismatch message carries.
+MAX_DIFF_CHARS = 320
+
 
 class ReplayMismatch(AssertionError):
-    """The replayed state hashes differ from the recorded ones."""
+    """The replayed state hashes differ from the recorded ones.
 
-    def __init__(self, step: int, expected: str, actual: str) -> None:
-        self.step = step
-        self.expected = expected
-        self.actual = actual
-        super().__init__(
-            f"replay diverged at step {step}: recorded hash {expected[:16]}… "
-            f"but the fresh run produced {actual[:16]}…"
+    ``diff`` is the bounded first-difference **state diff** ``docs/07`` §10.4
+    promises: the recorded and fresh state lines at the diverging step reduced
+    to the fields whose value changed (``name recorded -> fresh``), with the
+    last agreeing line kept as context. Logs recorded before ``states``
+    existed still raise, they just cannot show the diff.
+    """
+
+    def __init__(
+        self,
+        step: int,
+        expected: str,
+        actual: str,
+        *,
+        recorded_state: str = "",
+        live_state: str = "",
+        previous_state: str = "",
+    ) -> None:
+        self.step = int(step)
+        self.expected = str(expected)
+        self.actual = str(actual)
+        self.recorded_state = str(recorded_state)[:MAX_STATE_CHARS]
+        self.live_state = str(live_state)[:MAX_STATE_CHARS]
+        self.previous_state = str(previous_state)[:MAX_STATE_CHARS]
+        self.diff = diff_state_lines(self.recorded_state, self.live_state)
+        message = (
+            f"replay diverged at step {self.step}: recorded hash {self.expected[:16]}… "
+            f"but the fresh run produced {self.actual[:16]}…"
         )
+        if self.diff:
+            message += f"; state diff (recorded -> fresh): {self.diff}"
+            if self.previous_state:
+                message += f"; last agreeing state: {self.previous_state}"
+        elif not self.recorded_state:
+            message += "; no state lines in this log (recorded before the §10.4 diff landed)"
+        elif not self.live_state:
+            message += f"; recorded state {self.recorded_state}; the fresh run gave no state line"
+        else:
+            message += f"; recorded state {self.recorded_state}; fresh state {self.live_state}"
+        super().__init__(message)
+
+
+# --------------------------------------------------------------------------- #
+# State diff (``docs/07`` §10.4: "a divergence fails with the first differing
+# tick and a state diff")
+# --------------------------------------------------------------------------- #
+def _format_value(value: Any, digits: int = 2) -> str:
+    """One bounded, JSON-free rendering of a scalar or a short sequence."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.{digits}f}"
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return ",".join(_format_value(item, digits) for item in value)
+    return str(value)
+
+
+def state_line(info: Mapping[str, Any]) -> str:
+    """Bounded canonical state line for the replay failure report.
+
+    Summarises the quantities the engine's own canonical ``state_string``
+    (``scripts/rl/rl_env.gd``, ``docs/07`` §10.3) covers — tick/level, player
+    HP, kills and the living-enemy count, gold, the portal, the boss, the arena
+    wave, the absolute player cell/position and the ``stuck`` diagnostic — from
+    the ``info`` the client already receives. The engine's string is far too
+    large to store per step; this line is capped at :data:`MAX_STATE_CHARS`.
+    """
+
+    def get(key: str, default: Any = 0.0) -> Any:
+        return info.get(key, default)
+
+    fields = (
+        ("tick", _format_value(get("tick", 0), 0)),
+        ("level", _format_value(get("level", 0), 0)),
+        ("hp", _format_value(get("hp", 0.0))),
+        ("kills", _format_value(get("kills", 0), 0)),
+        ("alive", _format_value(get("enemies_alive", 0), 0)),
+        ("gold", _format_value(get("gold", 0), 0)),
+        ("cell", _format_value(get("player_cell", (0.0, 0.0)))),
+        ("pos", _format_value(get("player_position", (0.0, 0.0)), 1)),
+        (
+            "portal",
+            f"{_format_value(get('portal_active', False), 0)}"
+            f"@{_format_value(get('portal_distance', 0.0))}",
+        ),
+        ("boss", f"{_format_value(get('boss_hp', 0.0))}/{_format_value(get('boss_phase', 0), 0)}"),
+        ("wave", _format_value(get("wave", -1), 0)),
+        ("stuck", _format_value(get("stuck", False), 0)),
+    )
+    return "|".join(f"{name}={value}" for name, value in fields)[:MAX_STATE_CHARS]
+
+
+def _state_fields(line: str) -> dict[str, str]:
+    """``{name: value}`` of one :func:`state_line` string."""
+    return {
+        name: value
+        for name, _, value in (part.partition("=") for part in str(line).split("|"))
+        if name
+    }
+
+
+def diff_state_lines(recorded: str, live: str) -> str:
+    """Bounded ``name recorded -> fresh`` diff of two state lines.
+
+    Empty when either side is missing (a log without ``states``) or when the
+    lines agree field by field. The result never exceeds
+    :data:`MAX_DIFF_CHARS`.
+    """
+    if not recorded or not live:
+        return ""
+    left = _state_fields(recorded)
+    right = _state_fields(live)
+    changes = [
+        f"{name} {value} -> {right.get(name, '?')}"
+        for name, value in left.items()
+        if right.get(name, "?") != value
+    ]
+    text = ", ".join(changes)
+    if len(text) > MAX_DIFF_CHARS:
+        text = text[: MAX_DIFF_CHARS - 1] + "…"
+    return text
 
 
 def default_policy(name: str, seed: int, layout: Layout) -> Policy:
@@ -74,6 +193,7 @@ def record(
     obs, info = env.reset(seed=int(seed), options=dict(options or {}))
     actions: list[list[int]] = []
     hashes: list[str] = []
+    states: list[str] = []
     rewards: list[float] = []
     terminal: dict[str, Any] = {}
     for _ in range(int(steps)):
@@ -82,6 +202,7 @@ def record(
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(float(reward))
         hashes.append(str(info.get("state_hash", "")))
+        states.append(state_line(info))
         if terminated or truncated:
             terminal = {
                 "terminated": bool(terminated),
@@ -113,6 +234,7 @@ def record(
         "policy": policy_name,
         "actions": actions,
         "hashes": hashes,
+        "states": states,
         "rewards": rewards,
         "terminal": terminal,
     }
@@ -127,8 +249,11 @@ def replay(env: AshCrownEnv | None, log: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"replay log version {version} is not supported ({LOG_VERSION})")
     hashes = list(log.get("hashes") or [])
     actions = list(log.get("actions") or [])
+    states = list(log.get("states") or [])
     if len(hashes) != len(actions):
         raise ValueError(f"log has {len(actions)} actions but {len(hashes)} hashes")
+    if len(states) != len(actions):
+        states = []  # logs written before the §10.4 state diff landed
     config = dict(log.get("config") or {})
     pins = dict(log.get("pins") or {})
     built = env is None
@@ -146,11 +271,21 @@ def replay(env: AshCrownEnv | None, log: Mapping[str, Any]) -> dict[str, Any]:
         if pins.get("layout_hash") and pins["layout_hash"] != target.layout_hash:
             raise ValueError(f"log layout_hash {pins['layout_hash']} != live {target.layout_hash}")
         obs, info = target.reset(seed=int(log.get("seed", 0)))
+        previous_state = state_line(info)
         for step, (action, expected) in enumerate(zip(actions, hashes, strict=True)):
             obs, reward, terminated, truncated, info = target.step(action)
             actual = str(info.get("state_hash", ""))
+            live_state = state_line(info)
             if actual != expected:
-                raise ReplayMismatch(step, str(expected), actual)
+                raise ReplayMismatch(
+                    step,
+                    str(expected),
+                    actual,
+                    recorded_state=str(states[step]) if states else "",
+                    live_state=live_state,
+                    previous_state=previous_state,
+                )
+            previous_state = live_state
             del reward
             if terminated or truncated:
                 if step != len(actions) - 1:
@@ -266,10 +401,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "LOG_VERSION",
+    "MAX_DIFF_CHARS",
+    "MAX_STATE_CHARS",
     "ReplayMismatch",
     "build_arg_parser",
     "default_policy",
+    "diff_state_lines",
     "main",
     "record",
     "replay",
+    "state_line",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - module CLI guard
+    raise SystemExit(main())

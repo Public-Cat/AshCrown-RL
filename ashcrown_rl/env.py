@@ -144,8 +144,15 @@ class AshCrownEnv(gym.Env):
         self.obs_len = int(self._layout.obs_len)
         self._layout_slices = self._layout.slices()
         self._validate_config_against_handshake()
+        # The published clamp (``docs/07`` §5, ``RLProtocol.OBS_CLAMP``) is the
+        # authority for the Box bounds: a build that widens or narrows it must
+        # not be silently coerced by the client.
+        self.obs_bound = self._obs_clamp(hello)
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.obs_len,), dtype=np.float32
+            low=self.obs_bound[0],
+            high=self.obs_bound[1],
+            shape=(self.obs_len,),
+            dtype=np.float32,
         )
         self.action_space = spaces.MultiDiscrete(np.array([9, 2, 2], dtype=np.int64))
         self.metadata = {
@@ -197,6 +204,16 @@ class AshCrownEnv(gym.Env):
         self._client = client
         self.hello = dict(client.hello or {})
 
+    def _obs_clamp(self, hello: Mapping[str, Any]) -> tuple[float, float]:
+        """``(low, high)`` of the observation space, from the handshake clamp."""
+        clamp = hello.get("obs_clamp")
+        if not isinstance(clamp, Sequence) or len(clamp) != 2:
+            raise LayoutError(f"handshake obs_clamp {clamp!r} is not a [low, high] pair")
+        low, high = float(clamp[0]), float(clamp[1])
+        if not low < high:
+            raise LayoutError(f"handshake obs_clamp {clamp!r} is empty")
+        return low, high
+
     def _validate_config_against_handshake(self) -> None:
         """Refuse config the live build cannot honour (engine would say BAD_CONFIG)."""
         characters = self.hello.get("character_ids") or []
@@ -210,8 +227,15 @@ class AshCrownEnv(gym.Env):
             raise ValueError(
                 f"obs_grid_radius={self.obs_grid_radius} but this build fixes it at {radius}"
             )
-        if self._layout.obs_len != self.obs_len:
-            raise LayoutError("layout obs_len disagrees with the handshake")
+        # ``obs_len`` is published twice: at the top level of the handshake and
+        # inside the ``layout`` table. A disagreement means the client would
+        # slice observations against a different table than the engine emits.
+        published_len = self.hello.get("obs_len")
+        if published_len is not None and int(published_len) != self.obs_len:
+            raise LayoutError(
+                f"handshake obs_len {published_len} disagrees with the layout "
+                f"table ({self.obs_len})"
+            )
 
     # -- Gym API ------------------------------------------------------------ #
     def reset(

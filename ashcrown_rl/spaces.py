@@ -476,12 +476,14 @@ class Layout:
         return PlayerFeatures(
             alive=bool(block[index["alive"]] >= 0.5),
             hp_frac=float(block[index["hp_frac"]]),
-            hp=float(block[index["hp_abs"]]) * 400.0,
-            max_hp=float(block[index["max_hp"]]) * 400.0,
+            hp=self.to_raw(PLAYER, "hp_abs", block[index["hp_abs"]]),
+            max_hp=self.to_raw(PLAYER, "max_hp", block[index["max_hp"]]),
             armor_fraction=float(block[index["armor"]]),
-            damage=float(block[index["damage"]]) * 80.0,
-            move_speed_px=float(block[index["move_speed"]]) * 500.0,
-            attack_speed_mult=float(block[index["attack_speed_mult"]]) * 3.0,
+            damage=self.to_raw(PLAYER, "damage", block[index["damage"]]),
+            move_speed_px=self.to_raw(PLAYER, "move_speed", block[index["move_speed"]]),
+            attack_speed_mult=self.to_raw(
+                PLAYER, "attack_speed_mult", block[index["attack_speed_mult"]]
+            ),
             cell_fraction=(float(block[index["cell_x"]]), float(block[index["cell_y"]])),
             facing=(float(block[index["facing_cos"]]), float(block[index["facing_sin"]])),
             state=next((name for name in states if block[index[f"state_{name}"]] >= 0.5), "other"),
@@ -489,10 +491,10 @@ class Layout:
             attack_hitbox_active=bool(block[index["attack_hitbox_active"]] >= 0.5),
             attack_queued=bool(block[index["attack_queued"]] >= 0.5),
             knocked_back=bool(block[index["knocked_back"]] >= 0.5),
-            attack_reach_px=float(block[index["attack_reach"]]) * 100.0,
+            attack_reach_px=self.to_raw(PLAYER, "attack_reach", block[index["attack_reach"]]),
             velocity_px=(
-                float(block[index["velocity_x"]]) * 500.0,
-                float(block[index["velocity_y"]]) * 500.0,
+                self.to_raw(PLAYER, "velocity_x", block[index["velocity_x"]]),
+                self.to_raw(PLAYER, "velocity_y", block[index["velocity_y"]]),
             ),
         )
 
@@ -537,16 +539,22 @@ class Layout:
                     hp_frac=float(row[index["hp_frac"]]),
                     state=state_name,
                     state_progress=float(row[index["state_progress"]]),
-                    windup_remaining_s=float(row[index["windup_remaining"]]) * 3.0,
+                    windup_remaining_s=self.to_raw(
+                        ENEMIES, "windup_remaining", row[index["windup_remaining"]]
+                    ),
                     hitbox_active=bool(row[index["attack_hitbox_active"]] >= 0.5),
-                    attack_cooldown_s=float(row[index["attack_cooldown"]]) * 5.0,
+                    attack_cooldown_s=self.to_raw(
+                        ENEMIES, "attack_cooldown", row[index["attack_cooldown"]]
+                    ),
                     is_elite=bool(row[index["is_elite"]] >= 0.5),
                     is_boss=bool(row[index["is_boss"]] >= 0.5),
-                    attack_reach_px=float(row[index["attack_reach"]]) * 200.0,
+                    attack_reach_px=self.to_raw(
+                        ENEMIES, "attack_reach", row[index["attack_reach"]]
+                    ),
                     asleep=bool(row[index["asleep"]] >= 0.5),
-                    move_speed_px=float(row[index["move_speed"]]) * 500.0,
-                    damage=float(row[index["damage"]]) * 80.0,
-                    scale_mult=float(row[index["scale"]]) * 2.0,
+                    move_speed_px=self.to_raw(ENEMIES, "move_speed", row[index["move_speed"]]),
+                    damage=self.to_raw(ENEMIES, "damage", row[index["damage"]]),
+                    scale_mult=self.to_raw(ENEMIES, "scale", row[index["scale"]]),
                     facing=(
                         float(row[index["facing_cos"]]),
                         float(row[index["facing_sin"]]),
@@ -625,11 +633,15 @@ class Layout:
         raw = self.slice(obs, EVENTS)
         values = {name: float(raw[i]) for i, name in enumerate(self.block(EVENTS).fields)}
         return Events(
-            damage_dealt=values.get("damage_dealt", 0.0) * 100.0,
-            damage_taken=values.get("damage_taken", 0.0) * 100.0,
-            kills=int(round(values.get("kills", 0.0) * 5.0)),
-            attacks_started=int(round(values.get("attacks_started", 0.0) * 5.0)),
-            hits_landed=int(round(values.get("hits_landed", 0.0) * 5.0)),
+            damage_dealt=self.to_raw(EVENTS, "damage_dealt", values.get("damage_dealt", 0.0)),
+            damage_taken=self.to_raw(EVENTS, "damage_taken", values.get("damage_taken", 0.0)),
+            kills=int(round(self.to_raw(EVENTS, "kills", values.get("kills", 0.0)))),
+            attacks_started=int(
+                round(self.to_raw(EVENTS, "attacks_started", values.get("attacks_started", 0.0)))
+            ),
+            hits_landed=int(
+                round(self.to_raw(EVENTS, "hits_landed", values.get("hits_landed", 0.0)))
+            ),
             level_cleared=values.get("level_cleared", 0.0) >= 0.5,
             died=values.get("died", 0.0) >= 0.5,
             portal_entered=values.get("portal_entered", 0.0) >= 0.5,
@@ -638,11 +650,11 @@ class Layout:
     # -- scalar summaries --------------------------------------------------- #
     def level(self, obs: np.ndarray) -> int:
         """Level index (0.1–1.0 normalised in the vector)."""
-        return int(round(self.value(obs, GLOBAL, "level") * 10.0))
+        return int(round(self.to_raw(GLOBAL, "level", self.value(obs, GLOBAL, "level"))))
 
     def game_seconds(self, obs: np.ndarray) -> float:
         """Episode game time in seconds."""
-        return self.value(obs, GLOBAL, "game_seconds") * 600.0
+        return self.to_raw(GLOBAL, "game_seconds", self.value(obs, GLOBAL, "game_seconds"))
 
     def tick_fraction(self, obs: np.ndarray) -> float:
         """``episode_tick / max_ticks`` (0–1)."""
@@ -650,15 +662,21 @@ class Layout:
 
     def enemies_alive(self, obs: np.ndarray) -> int:
         """Living enemy count for the floor (0–30 normalised)."""
-        return int(round(self.value(obs, GLOBAL, "enemies_alive") * 30.0))
+        return int(
+            round(self.to_raw(GLOBAL, "enemies_alive", self.value(obs, GLOBAL, "enemies_alive")))
+        )
 
     def enemies_spawned(self, obs: np.ndarray) -> int:
         """Enemies spawned this floor (kills + alive)."""
-        return int(round(self.value(obs, GLOBAL, "enemies_spawned") * 30.0))
+        return int(
+            round(
+                self.to_raw(GLOBAL, "enemies_spawned", self.value(obs, GLOBAL, "enemies_spawned"))
+            )
+        )
 
     def kills(self, obs: np.ndarray) -> int:
         """Kills this run (0–100 normalised)."""
-        return int(round(self.value(obs, GLOBAL, "kills") * 100.0))
+        return int(round(self.to_raw(GLOBAL, "kills", self.value(obs, GLOBAL, "kills"))))
 
     def level_cleared(self, obs: np.ndarray) -> bool:
         """True once the floor is cleared (``level_cleared``)."""
@@ -681,7 +699,9 @@ class Layout:
 
     def nearest_enemy_distance_cells(self, obs: np.ndarray) -> float:
         """Distance to the nearest perceived enemy in iso cells."""
-        return self.value(obs, GLOBAL, "nearest_enemy_distance") * self.rel_cell_scale
+        return self.to_raw(
+            GLOBAL, "nearest_enemy_distance", self.value(obs, GLOBAL, "nearest_enemy_distance")
+        )
 
 
 # --------------------------------------------------------------------------- #

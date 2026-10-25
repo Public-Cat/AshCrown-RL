@@ -22,7 +22,7 @@ from ashcrown_rl.env import (
     AshCrownEnv,
 )
 from ashcrown_rl.protocol import GodotError, ProtocolError, ResetResult, StepResult
-from ashcrown_rl.spaces import fixture_path, load_fixture_layout
+from ashcrown_rl.spaces import LayoutError, fixture_path, load_fixture_layout
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +145,27 @@ def test_spaces_come_from_the_handshake() -> None:
         assert env.layout.obs_len == layout.obs_len
     finally:
         env.close()
+
+
+def test_the_box_bounds_come_from_the_handshake_clamp() -> None:
+    """``docs/07`` §5 publishes ``obs_clamp``; the Box must follow it."""
+    client = StubClient()
+    client.hello = {**client.hello, "obs_clamp": [-2.0, 2.0]}
+    env = AshCrownEnv(client_factory=lambda: client)
+    try:
+        assert env.obs_bound == (-2.0, 2.0)
+        assert float(env.observation_space.low[0]) == -2.0
+        assert float(env.observation_space.high[0]) == 2.0
+    finally:
+        env.close()
+
+
+def test_a_handshake_that_disagrees_on_obs_len_is_refused() -> None:
+    """The top-level ``obs_len`` and the layout table must agree."""
+    client = StubClient()
+    client.hello = {**client.hello, "obs_len": int(client.hello["obs_len"]) + 1}
+    with pytest.raises(LayoutError, match="obs_len"):
+        AshCrownEnv(client_factory=lambda: client)
 
 
 def test_metadata_publishes_the_layout_and_action_meanings() -> None:
