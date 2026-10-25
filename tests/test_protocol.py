@@ -718,6 +718,29 @@ def test_live_idle_client_times_out_and_exits_two() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("arg", "flag"),
+    [
+        ("--rl-obs-grid=nope", "--rl-obs-grid"),
+        ("--rl-obs-grid-radius=abc", "--rl-obs-grid-radius"),
+        ("--rl-perception-px=abc", "--rl-perception-px"),
+        ("--rl-expose-portal=x", "--rl-expose-portal"),
+        ("--rl-obs-blocked=x", "--rl-obs-blocked"),
+    ],
+)
+def test_launch_rejects_a_malformed_observation_config(arg: str, flag: str) -> None:
+    """A typo in a config flag exits 2 with a message naming the flag."""
+    process = GodotProcess(_launch_config(extra_args=(arg,)))
+    try:
+        with pytest.raises(GodotProcessError) as caught:
+            process.start()
+        assert caught.value.returncode == 2, caught.value.stderr_tail
+        assert flag in caught.value.stderr_tail
+    finally:
+        process.close()
+
+
+@pytest.mark.integration
 def test_launch_reports_early_exit_with_a_stderr_tail() -> None:
     project = default_game_project()
     godot = find_godot()
@@ -822,6 +845,21 @@ def test_verify_handshake_checks_the_observation_config_against_the_blocks() -> 
             compat={},
             expected_obs_config={**GRID_CONFIG, "obs_grid_radius": 4},
         )
+
+
+def test_verify_handshake_reports_a_partial_expected_config() -> None:
+    """A partial ``expected_obs_config`` is a mismatch, not a ``KeyError``."""
+    hello = _config_hello(GRID_CONFIG, blocks=GRID_BLOCKS)
+    partial = {"obs_grid": True, "obs_grid_radius": 10}
+    with pytest.raises(ProtocolMismatch, match="perception_px"):
+        verify_handshake(hello, compat={}, expected_obs_config=partial)
+    # every missing key is named, in the documented order
+    with pytest.raises(ProtocolMismatch) as caught:
+        verify_handshake(hello, compat={}, expected_obs_config={})
+    message = str(caught.value)
+    missing = ("obs_grid", "obs_grid_radius", "perception_px", "expose_portal", "obs_blocked")
+    for key in missing:
+        assert key in message
 
 
 @pytest.mark.integration

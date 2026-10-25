@@ -320,6 +320,13 @@ def verify_handshake(
     if not isinstance(layout_hash, str) or len(layout_hash) != 64:
         raise ProtocolMismatch(f"handshake layout_hash={layout_hash!r} is not a SHA-256 hex")
     if expected_obs_config is not None:
+        missing = [key for key in OBS_CONFIG_KEYS if key not in expected_obs_config]
+        if missing:
+            raise ProtocolMismatch(
+                "expected observation_config is missing "
+                f"{', '.join(repr(key) for key in missing)}: a handshake cannot be verified "
+                "against a partial config (pass all five keys, docs/07 §5.1)"
+            )
         actual_config = hello.get("observation_config")
         if not isinstance(actual_config, Mapping):
             actual_config = (hello.get("layout") or {}).get("observation_config")

@@ -21,7 +21,7 @@ import pytest
 import ashcrown_rl
 from ashcrown_rl.baseline import HeuristicPolicy
 from ashcrown_rl.env import AshCrownEnv
-from ashcrown_rl.protocol import StepResult
+from ashcrown_rl.protocol import OBS_SCHEMA, StepResult
 from ashcrown_rl.replay import (
     LOG_VERSION,
     MAX_DIFF_CHARS,
@@ -37,10 +37,17 @@ from ashcrown_rl.replay import (
 PACKAGE_ROOT = Path(ashcrown_rl.__file__).resolve().parent.parent
 
 
+class _StubLayout:
+    """The slice of ``Layout`` that ``replay()``'s pin check reads."""
+
+    obs_schema = OBS_SCHEMA
+
+
 class ScriptedEnv:
     """Minimal env surface ``replay()`` needs (``layout_hash``/reset/step)."""
 
     layout_hash = "b" * 64
+    layout = _StubLayout()
 
     def __init__(self, hashes: list[str]) -> None:
         self.hashes = hashes
@@ -114,6 +121,17 @@ def test_replay_rejects_a_layout_mismatch() -> None:
     log["pins"]["layout_hash"] = "c" * 64
     with pytest.raises(ValueError, match="layout_hash"):
         replay(env, log)
+
+
+def test_replay_refuses_a_v1_log_even_with_a_matching_layout_hash() -> None:
+    """The ``obs_schema`` pin is checked on its own, not only via the hash."""
+    env = ScriptedEnv(["h1", "h2"])
+    log = _log(["h1", "h2"])
+    log["pins"]["obs_schema"] = "ashcrown-obs-v1"
+    assert log["pins"]["layout_hash"] == env.layout_hash, "the hashes still agree"
+    with pytest.raises(ValueError, match="obs_schema"):
+        replay(env, log)
+    assert env.seeds == [], "the log is refused before an episode runs"
 
 
 # --------------------------------------------------------------------------- #
