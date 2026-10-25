@@ -50,6 +50,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 from gymnasium.vector import AsyncVectorEnv, AutoresetMode
 from stable_baselines3 import PPO
@@ -392,8 +393,8 @@ class LevelSchedule:
         return self.levels[int(episode_index) % len(self.levels)]
 
 
-class CurriculumEnv:
-    """Picklable worker wrapper that assigns a level on every auto-reset.
+class CurriculumEnv(gym.Wrapper):
+    """Worker wrapper that assigns a level on every auto-reset.
 
     ``AsyncVectorEnv`` auto-resets with ``reset()`` (no options), so the level
     cannot come from the training loop. This wrapper injects one from a
@@ -401,25 +402,9 @@ class CurriculumEnv:
     """
 
     def __init__(self, env: Any, levels: Sequence[int]) -> None:
-        self.env = env
+        super().__init__(env)
         self.schedule = LevelSchedule(levels)
         self.episode_index = 0
-
-    # gymnasium.Env surface used by the vector worker ------------------------
-    @property
-    def observation_space(self) -> Any:
-        """Forward the observation space."""
-        return self.env.observation_space
-
-    @property
-    def action_space(self) -> Any:
-        """Forward the action space."""
-        return self.env.action_space
-
-    @property
-    def unwrapped(self) -> Any:
-        """Forward the unwrapped env."""
-        return self.env.unwrapped
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         """Reset with the next scheduled level unless the caller pins one."""
@@ -429,17 +414,60 @@ class CurriculumEnv:
         self.episode_index += 1
         return self.env.reset(seed=seed, options=opts)
 
+
+class ShapingWrapper(gym.Wrapper):
+    """Training-only intrinsic reward shaping (``docs/07`` §7 allows it).
+
+    The engine reward (``combat`` profile) is dense **once the player meets an
+    enemy**, but an untrained network that has not learned to explore never
+    meets one — the first RL-7 run spent 44k decisions in empty corners with
+    zero damage dealt or taken, so PPO had no gradient at all. This wrapper
+    adds two documented terms on top of the engine reward (the engine's own
+    components are untouched and still reported in ``info.reward_components``):
+
+    * ``explore_coef`` × newly ``visited`` cells in the local window — the
+      ``visited`` grid channel is monotone per floor, and the (2R+1)² window
+      slides with the player, so its positive delta is a cheap proxy for
+      "moved into unexplored ground";
+    * ``approach_coef`` × the decrease of the nearest *perceived* enemy
+      distance (a potential, only while an enemy is in the observation).
+
+    Both are small relative to a kill (+1.0), so the engine's objective stays
+    dominant; the shaped total is reported as ``info.shaping_reward``.
+    """
+
+    def __init__(self, env: Any, *, explore_coef: float = 0.0, approach_coef: float = 0.0) -> None:
+        super().__init__(env)
+        self.layout = env.unwrapped.layout
+        self.explore_coef = float(explore_coef)
+        self.approach_coef = float(approach_coef)
+        self._visited = 0.0
+        self._enemy_distance = 0.0
+
+    def _potential(self, obs: np.ndarray) -> tuple[float, float]:
+        visited = 0.0
+        if self.layout.grid_enabled:
+            grid = self.layout.grid(obs)
+            visited = float(np.sum(self.layout.channel(grid, "visited")))
+        distance = float(self.layout.nearest_enemy_distance_cells(obs))
+        return visited, distance
+
+    def reset(self, **kwargs: Any) -> tuple[np.ndarray, dict[str, Any]]:
+        obs, info = self.env.reset(**kwargs)
+        self._visited, self._enemy_distance = self._potential(obs)
+        return obs, info
+
     def step(self, action: Any):
-        """Step the wrapped environment."""
-        return self.env.step(action)
-
-    def close(self) -> None:
-        """Close the wrapped environment."""
-        self.env.close()
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate unknown attributes (``layout``, ``hello``, …)."""
-        return getattr(self.env, name)
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        visited, distance = self._potential(obs)
+        bonus = self.explore_coef * max(visited - self._visited, 0.0)
+        if self.approach_coef and distance > 0.0 and self._enemy_distance > 0.0:
+            bonus += self.approach_coef * max(self._enemy_distance - distance, 0.0)
+        self._visited = visited
+        self._enemy_distance = distance
+        info = dict(info)
+        info["shaping_reward"] = float(bonus)
+        return obs, float(reward) + float(bonus), terminated, truncated, info
 
 
 # --------------------------------------------------------------------------- #
@@ -565,15 +593,17 @@ def make_training_vec_env(
     seed: int,
     env_kwargs: Mapping[str, Any],
     levels: Sequence[int] | None = None,
+    shaping: Mapping[str, float] | None = None,
 ) -> Sb3AshCrownVecEnv:
-    """Build the SB3 vector env (optionally level-scheduled) for training."""
+    """Build the SB3 vector env (optionally level-scheduled and shaped)."""
     kwargs = dict(env_kwargs)
-    if not levels:
+    shaping_active = any(float(value) for value in dict(shaping or {}).values())
+    if not levels and not shaping_active:
         return Sb3AshCrownVecEnv(make_vec_env(int(n_envs), seed=int(seed), env_kwargs=kwargs))
     # Mixed-level training: every auto-reset draws the next level of the
     # schedule, so the level cannot be pinned by the rollout loop.
     env_fns = [
-        _curriculum_worker_factory(dict(kwargs), int(worker_seed), list(levels))
+        _curriculum_worker_factory(dict(kwargs), int(worker_seed), list(levels or []), shaping)
         for worker_seed in worker_seeds(int(seed), int(n_envs))
     ]
     probe = ProbeSink()
@@ -594,13 +624,22 @@ def make_training_vec_env(
     return Sb3AshCrownVecEnv(vec)
 
 
-def _curriculum_worker_factory(kwargs: dict[str, Any], worker_seed: int, levels: list[int]) -> Any:
-    """Picklable ``env_fn`` building a level-scheduled worker env."""
+def _curriculum_worker_factory(
+    kwargs: dict[str, Any],
+    worker_seed: int,
+    levels: list[int],
+    shaping: Mapping[str, float] | None = None,
+) -> Any:
+    """Picklable ``env_fn`` building a level-scheduled, shaped worker env."""
     seed_sequence = np.random.SeedSequence(worker_seed)
+    shaping_kwargs = dict(shaping or {})
 
     def _factory() -> Any:
         seeder = SeededAshCrownEnv(AshCrownEnv(**kwargs), seed_sequence)
-        return CurriculumEnv(seeder, levels)
+        env: Any = CurriculumEnv(seeder, levels) if levels else seeder
+        if any(float(value) for value in shaping_kwargs.values()):
+            env = ShapingWrapper(env, **shaping_kwargs)
+        return env
 
     return _factory
 
@@ -616,8 +655,10 @@ def train_ppo(
     command: str,
     algorithm: Mapping[str, Any],
     hyperparameters: Mapping[str, Any] | None = None,
+    init_checkpoint: str | None = None,
     device: str = "cpu",
     levels: Sequence[int] | None = None,
+    shaping: Mapping[str, float] | None = None,
     save_freq: int = 100_000,
     eval_seeds: Mapping[str, Any] | None = None,
     git_paths: Mapping[str, str | Path] | None = None,
@@ -625,7 +666,11 @@ def train_ppo(
     """Train PPO and write checkpoints, their metadata and the curve CSV."""
     started = datetime.now(UTC).isoformat(timespec="seconds")
     vec = make_training_vec_env(
-        n_envs=int(n_envs), seed=int(seed), env_kwargs=env_kwargs, levels=levels
+        n_envs=int(n_envs),
+        seed=int(seed),
+        env_kwargs=env_kwargs,
+        levels=levels,
+        shaping=shaping,
     )
     metadata_factory: Callable[[int], dict[str, Any]]
     try:
@@ -656,6 +701,8 @@ def train_ppo(
                 "device": str(device),
                 "command": str(command),
                 "algorithm": dict(algorithm),
+                "shaping": dict(shaping or {}),
+                "init_checkpoint": str(init_checkpoint or ""),
             }
 
         hp = dict(hyperparameters or {})
@@ -671,6 +718,11 @@ def train_ppo(
             tensorboard_log=None,
             **hp,
         )
+        if init_checkpoint:
+            # Warm start: copy only the policy weights (fresh optimizer/rollout
+            # state), so this run's hyperparameters stay authoritative.
+            initial = PPO.load(str(init_checkpoint), device=device)
+            model.policy.load_state_dict(initial.policy.state_dict())
         curve = TrainingCurveCallback(log_csv, vec)
         checkpoint = MetadataCheckpointCallback(
             checkpoint_dir,
@@ -704,6 +756,7 @@ __all__ = [
     "METADATA_VERSION",
     "CurriculumEnv",
     "LevelSchedule",
+    "ShapingWrapper",
     "MetadataCheckpointCallback",
     "MetadataMismatch",
     "Sb3AshCrownVecEnv",

@@ -38,13 +38,16 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Empty
 from typing import Any
 
 import numpy as np
@@ -465,42 +468,228 @@ def _config(
     return config
 
 
-def _ppo_chunk(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Evaluate one seed chunk of a PPO checkpoint in its own process.
+#: Seconds a worker may spend on ONE seed before the watchdog kills the env.
+DEFAULT_SEED_TIMEOUT = 180.0
+#: Seconds a worker may spend starting its Godot process and loading the model.
+DEFAULT_STARTUP_TIMEOUT = 120.0
 
-    One task per worker (not per seed) so each worker builds its Godot process
-    and loads the model once, closes both, and returns the whole chunk — a
-    worker that dies leaves no stray process behind.
+
+class EvaluationTimeout(RuntimeError):
+    """A worker did not finish its chunk inside the wall-clock deadline."""
+
+
+def _ppo_chunk(payload: Mapping[str, Any], out: Any) -> None:  # pragma: no cover - worker
+    """Evaluate one seed chunk of a PPO checkpoint, streaming one message per seed.
+
+    Each worker owns one Godot process and loads the model once. Three layers
+    keep a wedged environment from hanging the run (the RL-7 crash: the parent
+    slept forever with seven idle Godot children):
+
+    1. a per-seed :class:`threading.Timer` closes the env, which kills the
+       Godot process and unblocks the socket read with a protocol error;
+    2. an env that raised is discarded and rebuilt for the next seed, so one
+       bad episode costs one seed and not the whole chunk;
+    3. every seed result is put on ``out`` immediately, so the parent keeps the
+       seeds that already finished if the worker itself has to be killed.
     """
-    env = AshCrownEnv(**dict(payload["env_kwargs"]))
+    chunk = int(payload.get("chunk", 0))
+    per_seed = float(payload.get("seed_timeout") or 0.0)
+    # Torch's default thread pool is sized for one process, not for four
+    # workers on a 32-core host: without this the workers thrash each other and
+    # a seed that takes 4 s alone needs >100 s (measured, RL-7).
     try:
-        policy = resolve_policy(
-            "ppo", 0, env.layout, checkpoint=str(payload["checkpoint"]), env=env
-        )
-        episodes = [
-            run_episode(
-                env,
-                seed=int(seed),
-                policy=policy,
-                policy_name="ppo",
-                level=payload.get("level"),
-                options=payload.get("options"),
-                max_steps=payload.get("max_steps"),
-                record_hashes=False,
-            )
-            for seed in payload["seeds"]
-        ]
-        config = _config(
-            env,
-            policy_name="ppo",
-            seeds=payload["seeds"],
-            repeat=1,
-            level=payload.get("level"),
-            checkpoint=str(payload["checkpoint"]),
-        )
-        return {"episodes": episodes, "pins": _pins(env), "config": config}
+        import torch  # noqa: PLC0415 - optional, training extra only
+    except ImportError:  # pragma: no cover - numpy-only install
+        pass
+    else:
+        torch.set_num_threads(1)
+    env: AshCrownEnv | None = None
+    policy: Policy | None = None
+    try:
+        for seed in payload["seeds"]:
+            started = time.perf_counter()
+            watchdog: threading.Timer | None = None
+            try:
+                if env is None or policy is None:
+                    env = AshCrownEnv(**dict(payload["env_kwargs"]))
+                    policy = resolve_policy(
+                        "ppo", 0, env.layout, checkpoint=str(payload["checkpoint"]), env=env
+                    )
+                if per_seed > 0.0:
+                    watchdog = threading.Timer(per_seed, env.close)
+                    watchdog.daemon = True
+                    watchdog.start()
+                metrics = run_episode(
+                    env,
+                    seed=int(seed),
+                    policy=policy,
+                    policy_name="ppo",
+                    level=payload.get("level"),
+                    options=payload.get("options"),
+                    max_steps=payload.get("max_steps"),
+                    record_hashes=False,
+                )
+                message: dict[str, Any] = {
+                    "kind": "seed",
+                    "chunk": chunk,
+                    "seed": int(seed),
+                    "metrics": metrics,
+                    "wall_seconds": round(time.perf_counter() - started, 3),
+                    "pins": _pins(env),
+                    "config": _config(
+                        env,
+                        policy_name="ppo",
+                        seeds=payload["seeds"],
+                        repeat=1,
+                        level=payload.get("level"),
+                        checkpoint=str(payload["checkpoint"]),
+                    ),
+                }
+                out.put(message)
+            except (ProtocolError, OSError, RuntimeError, ValueError) as exc:
+                timed_out = env is not None and env.closed
+                out.put(
+                    {
+                        "kind": "timeout" if timed_out else "error",
+                        "chunk": chunk,
+                        "seed": int(seed),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "wall_seconds": round(time.perf_counter() - started, 3),
+                    }
+                )
+                if env is not None:
+                    env.close()
+                env = None
+                policy = None
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
     finally:
-        env.close()
+        if env is not None:
+            env.close()
+        out.put({"kind": "done", "chunk": chunk})
+
+
+def _children(pid: int) -> list[int]:
+    """Live PIDs whose parent is ``pid`` (Linux ``/proc`` scan; ``[]`` elsewhere)."""
+    found: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:  # pragma: no cover - non-Linux hosts
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fields = stat[stat.rfind(")") + 2 :].split()
+        if len(fields) > 1 and fields[1].isdigit() and int(fields[1]) == int(pid):
+            found.append(int(entry))
+    return found
+
+
+def _kill(pid: int) -> None:
+    """Best-effort ``SIGKILL`` of ``pid`` (already-dead pids are ignored)."""
+    try:
+        os.kill(int(pid), 9)
+    except (OSError, ProcessLookupError):
+        return
+
+
+def _terminate_worker(process: Any) -> list[int]:
+    """Kill a stuck worker **and its Godot children**, then reap it.
+
+    A worker that is killed outright leaves its Godot child orphaned (reparented
+    to init), which is exactly the stray-process pile-up the RL-7 crash left
+    behind, so the children are killed first, while the worker still owns them.
+    """
+    killed = _children(process.pid)
+    for child in killed:
+        _kill(child)
+    process.terminate()
+    process.join(10.0)
+    if process.is_alive():  # pragma: no cover - SIGTERM ignored
+        for child in _children(process.pid):
+            _kill(child)
+        process.kill()
+        process.join(5.0)
+    return killed
+
+
+def _run_worker_pool(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    workers: int,
+    startup_timeout: float,
+    seed_timeout: float,
+    on_message: Callable[[dict[str, Any]], None],
+) -> list[dict[str, Any]]:
+    """Run ``payloads`` over at most ``workers`` processes with hard deadlines.
+
+    The parent never blocks on a worker without a deadline: it polls the shared
+    queue, so a seed result is reported the moment it arrives, and a worker that
+    blows ``startup_timeout + seed_timeout × len(chunk)`` is killed together
+    with its Godot children. Seeds that never reported come back as ``timeout``
+    records instead of vanishing.
+    """
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    pending = deque(payloads)
+    running: dict[int, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+    while pending or running:
+        while pending and len(running) < max(int(workers), 1):
+            payload = pending.popleft()
+            chunk = int(payload.get("chunk", 0))
+            process = context.Process(target=_ppo_chunk, args=(payload, queue), daemon=True)
+            process.start()
+            running[chunk] = {
+                "process": process,
+                "payload": payload,
+                "reported": set(),
+                "deadline": time.monotonic()
+                + float(startup_timeout)
+                + float(seed_timeout) * len(payload["seeds"]),
+            }
+        try:
+            message = queue.get(timeout=0.25)
+        except Empty:
+            message = None
+        if message is not None:
+            chunk = int(message.get("chunk", -1))
+            entry = running.get(chunk)
+            if entry is not None:
+                if message.get("kind") == "done":
+                    entry["process"].join(10.0)
+                    running.pop(chunk, None)
+                else:
+                    entry["reported"].add(int(message.get("seed", -1)))
+            if message.get("kind") in ("timeout", "error"):
+                failures.append(dict(message))
+            on_message(dict(message))
+        for chunk, entry in list(running.items()):
+            if time.monotonic() < entry["deadline"]:
+                continue
+            killed = _terminate_worker(entry["process"])
+            missing = [
+                int(seed)
+                for seed in entry["payload"]["seeds"]
+                if int(seed) not in entry["reported"]
+            ]
+            for seed in missing:
+                failures.append(
+                    {
+                        "kind": "timeout",
+                        "chunk": chunk,
+                        "seed": seed,
+                        "error": f"worker killed after {entry['deadline'] - 0:.0f}s deadline",
+                        "godot_children_killed": len(killed),
+                    }
+                )
+            running.pop(chunk, None)
+    return failures
 
 
 def split_seeds(seeds: Sequence[int], workers: int) -> list[list[int]]:
@@ -523,11 +712,24 @@ def evaluate_ppo(
     max_steps: int | None = None,
     workers: int = 1,
     csv_path: str | Path | None = None,
+    out_path: str | Path | None = None,
+    seed_timeout: float = DEFAULT_SEED_TIMEOUT,
+    startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    progress: bool = True,
 ) -> dict[str, Any]:
-    """Fixed-seed PPO evaluation, optionally over ``workers`` processes."""
+    """Fixed-seed PPO evaluation, optionally over ``workers`` processes.
+
+    ``out_path`` is rewritten after **every** seed, so an interrupted run still
+    leaves a usable artifact (marked ``"partial": true`` and listing the seeds
+    that have not finished yet). ``seed_timeout`` bounds one seed and
+    ``startup_timeout`` bounds process start plus model load; a worker that
+    exceeds them is killed with its Godot children and its seeds are reported as
+    ``timeout`` failures instead of hanging the run.
+    """
     started_wall = datetime.now(UTC).isoformat(timespec="seconds")
     clock = time.perf_counter()
     seeds = [int(seed) for seed in seeds]
+    failures: list[dict[str, Any]] = []
     if int(workers) <= 1:
         env = AshCrownEnv(**dict(env_kwargs or {}))
         try:
@@ -560,39 +762,74 @@ def evaluate_ppo(
         chunks = split_seeds(seeds, int(workers))
         payloads = [
             {
+                "chunk": index,
                 "checkpoint": str(checkpoint),
                 "env_kwargs": dict(env_kwargs or {}),
                 "seeds": chunk,
                 "level": level,
                 "options": dict(options or {}),
                 "max_steps": max_steps,
+                "seed_timeout": float(seed_timeout),
             }
-            for chunk in chunks
+            for index, chunk in enumerate(chunks)
         ]
-        context = multiprocessing.get_context("spawn")
         episodes = []
         pins: dict[str, Any] = {}
         config: dict[str, Any] = {}
-        with ProcessPoolExecutor(
-            max_workers=min(int(workers), len(payloads)), mp_context=context
-        ) as pool:
-            results = list(pool.map(_ppo_chunk, payloads))
-        for result in results:
-            pins = pins or result["pins"]
-            config = config or result["config"]
-            episodes.extend(result["episodes"])
+
+        def _on_message(message: dict[str, Any]) -> None:
+            nonlocal pins, config
+            if message.get("kind") == "seed":
+                metrics = message["metrics"]
+                episodes.append(metrics)
+                pins = pins or dict(message.get("pins") or {})
+                config = config or dict(message.get("config") or {})
+                if progress:
+                    print("EVAL_SEED " + json.dumps(_seed_line(metrics.as_dict())), flush=True)
+                    _write_partial(
+                        out_path,
+                        csv_path,
+                        started_wall=started_wall,
+                        seeds=seeds,
+                        episodes=episodes,
+                        pins=pins,
+                        config=config,
+                        failures=failures,
+                        elapsed=time.perf_counter() - clock,
+                        workers=int(workers),
+                    )
+            elif progress and message.get("kind") in ("timeout", "error"):
+                print(
+                    "EVAL_WARN " + json.dumps({k: v for k, v in message.items() if k != "metrics"}),
+                    flush=True,
+                )
+
+        failures = _run_worker_pool(
+            payloads,
+            workers=int(workers),
+            startup_timeout=float(startup_timeout),
+            seed_timeout=float(seed_timeout),
+            on_message=_on_message,
+        )
         episodes.sort(key=lambda metrics: metrics.seed)
+        if config:
+            config["seeds"] = list(seeds)
     elapsed = time.perf_counter() - clock
     summary = _episode_summary(episodes)
     if csv_path is not None:
         write_csv(csv_path, episodes)
-    return {
+    report = {
         "generated": started_wall,
         "elapsed_seconds": round(elapsed, 3),
+        "partial": False,
         "pins": pins,
         "config": config,
         "episodes": [metrics.as_dict() for metrics in episodes],
         "aggregates": summary,
+        "failures": list(failures),
+        "timed_out_seeds": sorted(
+            int(failure["seed"]) for failure in failures if failure.get("kind") == "timeout"
+        ),
         "determinism": {
             "repeats": 1,
             "identical": True,
@@ -601,6 +838,66 @@ def evaluate_ppo(
             "note": "determinism check runs on --repeat > 1 (sequential path)",
         },
         "workers": int(workers),
+    }
+    if out_path is not None:
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    return report
+
+
+def _write_partial(
+    out_path: str | Path | None,
+    csv_path: str | Path | None,
+    *,
+    started_wall: str,
+    seeds: Sequence[int],
+    episodes: Sequence[EpisodeMetrics],
+    pins: Mapping[str, Any],
+    config: Mapping[str, Any],
+    failures: Sequence[Mapping[str, Any]],
+    elapsed: float,
+    workers: int,
+) -> None:
+    """Rewrite the JSON/CSV artifacts with the seeds measured so far."""
+    if csv_path is not None:
+        write_csv(csv_path, episodes)
+    if out_path is None:
+        return
+    done = {int(metrics.seed) for metrics in episodes}
+    report = {
+        "generated": started_wall,
+        "elapsed_seconds": round(float(elapsed), 3),
+        "partial": True,
+        "seeds_pending": [int(seed) for seed in seeds if int(seed) not in done],
+        "pins": dict(pins),
+        "config": dict(config),
+        "episodes": [metrics.as_dict() for metrics in episodes],
+        "aggregates": _episode_summary(episodes),
+        "failures": list(failures),
+        "workers": int(workers),
+    }
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+
+
+def _seed_line(episode: Mapping[str, Any]) -> dict[str, Any]:
+    """The one-line per-seed stdout record both evaluation paths print."""
+    return {
+        "seed": episode["seed"],
+        "reason": episode["terminal_reason"],
+        "decisions": episode["steps"],
+        "seconds": episode["game_seconds"],
+        "swings": episode["attacks_started"],
+        "hits": episode["hits_landed"],
+        "requests": episode["attack_requests"],
+        "hits_per_swing": episode["hits_per_swing"],
+        "hits_per_request": episode["hits_per_request"],
+        "dmg_dealt": episode["damage_dealt"],
+        "dmg_taken": episode["damage_taken"],
+        "kills": episode["kills"],
+        "hp": episode["player_hp"],
     }
 
 
@@ -666,9 +963,25 @@ def write_csv(path: str | Path, episodes: Sequence[EpisodeMetrics]) -> Path:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def expand_seed_ranges(text: str | None) -> list[int]:
+    """``"1000-1004,7"`` -> ``[1000, 1001, 1002, 1003, 1004, 7]``."""
+    seeds: list[int] = []
+    if not text:
+        return seeds
+    for chunk in str(text).replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk[1:]:
+            first, _, last = chunk.partition("-")
+            seeds.extend(range(int(first), int(last) + 1))
+        else:
+            seeds.append(int(chunk))
+    return seeds
+
+
 def _parse_seeds(args: argparse.Namespace) -> list[int]:
     if args.seeds:
-        return [int(value) for value in str(args.seeds).replace(",", " ").split()]
+        return expand_seed_ranges(args.seeds)
     return [int(args.seed_start) + offset for offset in range(int(args.seed_count))]
 
 
@@ -696,6 +1009,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-count", type=int, default=10, help="number of seeds")
     parser.add_argument("--repeat", type=int, default=2, help="runs per seed (determinism)")
     parser.add_argument("--max-steps", type=int, default=None, help="optional step cap")
+    parser.add_argument(
+        "--seed-timeout",
+        type=float,
+        default=DEFAULT_SEED_TIMEOUT,
+        help="wall-clock seconds one seed may take before the env is killed (--policy ppo)",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=DEFAULT_STARTUP_TIMEOUT,
+        help="wall-clock seconds a worker may spend starting Godot + loading the model",
+    )
     parser.add_argument("--with-hashes", action="store_true", help="store hash sequences")
     parser.add_argument("--game-project", default=None, help="game checkout (default: auto)")
     parser.add_argument("--godot-bin", default=None, help="godot binary (default: auto)")
@@ -727,6 +1052,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_steps=args.max_steps,
                 workers=args.workers,
                 csv_path=args.csv,
+                out_path=args.out,
+                seed_timeout=args.seed_timeout,
+                startup_timeout=args.startup_timeout,
             )
         else:
             report = evaluate(
@@ -746,40 +1074,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     summary = {
-        "policy": report["config"]["policy"],
-        "level": report["config"]["level"],
-        "seeds": report["config"]["seeds"],
+        "policy": report["config"].get("policy", args.policy),
+        "level": report["config"].get("level", args.level),
+        "seeds": report["config"].get("seeds", seeds),
         "clears": report["aggregates"]["clears"],
         "episodes": report["aggregates"]["episodes"],
         "success_rate": report["aggregates"]["success_rate"],
         "mean_game_seconds": report["aggregates"]["mean_game_seconds"],
         "deterministic": report["determinism"]["identical"],
+        "failures": len(report.get("failures") or []),
+        "timed_out_seeds": report.get("timed_out_seeds") or [],
         "out": args.out,
         "csv": args.csv,
     }
     print("EVAL " + json.dumps(summary, sort_keys=True))
     for episode in report["episodes"]:
-        print(
-            "EVAL_SEED "
-            + json.dumps(
-                {
-                    "seed": episode["seed"],
-                    "reason": episode["terminal_reason"],
-                    "decisions": episode["steps"],
-                    "seconds": episode["game_seconds"],
-                    "swings": episode["attacks_started"],
-                    "hits": episode["hits_landed"],
-                    "requests": episode["attack_requests"],
-                    "hits_per_swing": episode["hits_per_swing"],
-                    "hits_per_request": episode["hits_per_request"],
-                    "dmg_dealt": episode["damage_dealt"],
-                    "dmg_taken": episode["damage_taken"],
-                    "kills": episode["kills"],
-                    "hp": episode["player_hp"],
-                },
-                sort_keys=True,
-            )
-        )
+        print("EVAL_SEED " + json.dumps(_seed_line(episode), sort_keys=True))
+    if summary["timed_out_seeds"] or summary["failures"]:
+        return 3
     return 0 if report["determinism"]["identical"] else 2
 
 

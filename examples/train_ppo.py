@@ -105,6 +105,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--net-arch", default="256,256", help="hidden layers, e.g. 256,256")
     parser.add_argument("--device", default="cpu", help="cpu | cuda | auto (policy update)")
+    parser.add_argument(
+        "--explore-coef",
+        type=float,
+        default=0.02,
+        help="training-only reward per newly visited grid cell (0 disables shaping)",
+    )
+    parser.add_argument(
+        "--approach-coef",
+        type=float,
+        default=0.05,
+        help="training-only reward per cell of reduced nearest-enemy distance",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="warm-start policy weights (examples/bc_pretrain.py output)",
+    )
     parser.add_argument("--checkpoint-dir", default="runs/ppo", help="checkpoint directory")
     parser.add_argument(
         "--log-csv", default=None, help="training-curve CSV (default: dir/curve.csv)"
@@ -196,8 +213,13 @@ def main(argv: list[str] | None = None) -> int:
         command=command,
         algorithm=algorithm,
         hyperparameters=algorithm["hyperparameters"],
+        init_checkpoint=args.init_checkpoint,
         device=args.device,
         levels=levels,
+        shaping={
+            "explore_coef": args.explore_coef,
+            "approach_coef": args.approach_coef,
+        },
         save_freq=args.save_freq,
         eval_seeds={
             "train_master": int(args.seed),
