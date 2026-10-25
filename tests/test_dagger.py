@@ -29,6 +29,7 @@ from ashcrown_rl.dagger import (
     save_dataset,
     write_rounds,
 )
+from scripts.bc_diagnose import head_metrics
 
 
 class _FakePolicy:
@@ -131,6 +132,25 @@ def test_head_report_flags_a_collapsed_attack_head() -> None:
     assert report["attack_pred_rate"] == pytest.approx(0.0)
     assert report["exact_match"] == pytest.approx(0.5)
     assert report["mean_log_prob"] < 0.0
+
+
+def test_head_metrics_confusion_matrix_is_row_normalisable() -> None:
+    labels = np.array([0, 0, 1, 1, 2])
+    logits = np.array(
+        [
+            [4.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],  # 0 misread as 1
+            [4.0, 0.0, 0.0],  # 1 misread as 0
+            [0.0, 4.0, 0.0],
+            [0.0, 0.0, 4.0],
+        ]
+    )
+    metrics = head_metrics("move", labels, logits, confusion=True)
+    assert metrics["accuracy"] == pytest.approx(0.6)
+    matrix = metrics["confusion"]
+    assert [sum(row) for row in matrix] == [2, 2, 1]
+    assert matrix[0][1] == 1
+    assert matrix[1][0] == 1
 
 
 def test_round_row_fills_every_column() -> None:

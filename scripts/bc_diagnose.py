@@ -44,7 +44,9 @@ from ashcrown_rl.train import read_metadata  # noqa: E402
 HEADS: tuple[str, ...] = ("move", "attack", "interact")
 
 
-def head_metrics(name: str, labels: np.ndarray, logits: np.ndarray) -> dict[str, Any]:
+def head_metrics(
+    name: str, labels: np.ndarray, logits: np.ndarray, *, confusion: bool = False
+) -> dict[str, Any]:
     """Accuracy and distribution statistics for one categorical head."""
     predicted = np.argmax(logits, axis=1)
     classes = int(logits.shape[1])
@@ -53,7 +55,7 @@ def head_metrics(name: str, labels: np.ndarray, logits: np.ndarray) -> dict[str,
     probabilities = np.exp(logits - logits.max(axis=1, keepdims=True))
     probabilities /= probabilities.sum(axis=1, keepdims=True)
     chosen = probabilities[np.arange(len(labels)), labels]
-    return {
+    payload: dict[str, Any] = {
         "head": name,
         "classes": classes,
         "accuracy": float(np.mean(predicted == labels)),
@@ -66,12 +68,20 @@ def head_metrics(name: str, labels: np.ndarray, logits: np.ndarray) -> dict[str,
         "mean_prob_of_label": float(np.mean(chosen)),
         "mean_nll": float(-np.mean(np.log(np.clip(chosen, 1e-12, 1.0)))),
     }
+    if confusion:
+        matrix = np.zeros((classes, classes), dtype=np.int64)
+        for label, guess in zip(labels.tolist(), predicted.tolist(), strict=True):
+            matrix[int(label), int(guess)] += 1
+        payload["confusion"] = matrix.tolist()
+    return payload
 
 
 def measure(
     model: PPO,
     observations: np.ndarray,
     actions: np.ndarray,
+    *,
+    confusion: bool = False,
 ) -> dict[str, Any]:
     """Run the cloned policy over ``(obs, action)`` pairs and summarise."""
     import torch as th  # noqa: PLC0415 - only the diagnostic needs torch typing
@@ -83,7 +93,9 @@ def measure(
         # three per-head ``Categorical`` objects (SB3 >= 2.x).
         logits = [head.logits for head in distribution.distribution]
         per_head = [
-            head_metrics(HEADS[index], actions[:, index], np.asarray(logit))
+            head_metrics(
+                HEADS[index], actions[:, index], np.asarray(logit), confusion=confusion
+            )
             for index, logit in enumerate(logits)
         ]
         joint = np.stack([np.argmax(np.asarray(logit), axis=1) for logit in logits], axis=1)
@@ -134,6 +146,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--character", default="warrior")
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-ticks", type=int, default=18_000)
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="measure stored rows (the DAgger aggregate) instead of fresh demos",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=0,
+        help="with --dataset: use only the last N rows (one DAgger round's own rows)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=("all", "demo", "dagger"),
+        default="all",
+        help="with --dataset: keep only rows of this provenance",
+    )
+    parser.add_argument(
+        "--confusion",
+        action="store_true",
+        help="also report each head's label-vs-predicted confusion matrix",
+    )
     parser.add_argument("--verify-config", action="store_true")
     parser.add_argument("--out", default=None)
     return parser
@@ -154,6 +188,35 @@ def main(argv: list[str] | None = None) -> int:
         report["config"] = verify_config(checkpoint, env_kwargs)
         print("BC_CONFIG " + json.dumps(report["config"]), flush=True)
     model = PPO.load(str(checkpoint), device="cpu")
+    if args.dataset:
+        from ashcrown_rl.dagger import SOURCE_DAGGER, SOURCE_DEMO, load_dataset  # noqa: PLC0415
+
+        dataset = load_dataset(args.dataset)
+        keep = np.ones(dataset.samples, dtype=bool)
+        if args.source != "all":
+            wanted = SOURCE_DAGGER if args.source == "dagger" else SOURCE_DEMO
+            keep &= dataset.sources == wanted
+        if int(args.tail) > 0:
+            rows = np.flatnonzero(keep)[-int(args.tail) :]
+            keep = np.zeros(dataset.samples, dtype=bool)
+            keep[rows] = True
+        report["dataset"] = {
+            "path": str(args.dataset),
+            "source": args.source,
+            "tail": int(args.tail),
+            **measure(
+                model,
+                dataset.obs[keep],
+                dataset.actions[keep],
+                confusion=True,
+            ),
+        }
+        print("BC_DATASET " + json.dumps(report["dataset"]), flush=True)
+        if args.out:
+            target = Path(args.out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return 0
     for label, seed in (("held_out", args.seed), ("train", args.check_train_seed)):
         if seed is None:
             continue
