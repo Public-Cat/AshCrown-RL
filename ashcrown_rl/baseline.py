@@ -29,7 +29,15 @@ from typing import Any
 
 import numpy as np
 
-from .spaces import PX_PER_CELL, EnemySlot, Layout, PlayerFeatures, normalise, screen_delta
+from .spaces import (
+    PX_PER_CELL,
+    EnemySlot,
+    Layout,
+    PlayerFeatures,
+    PortalFeatures,
+    normalise,
+    screen_delta,
+)
 
 
 @dataclass(frozen=True)
@@ -39,17 +47,21 @@ class HeuristicConfig:
     #: Extra pixels on the player's weapon reach before it swings (enemy hurtbox).
     attack_slack_px: float = 24.0
     #: Extra pixels on the enemy's reach that count as "dangerously close".
-    retreat_slack_px: float = 16.0
+    retreat_slack_px: float = 30.0
     #: Minimum ``dot(facing, to_enemy)`` before swinging (the swing locks facing).
     facing_cos: float = 0.8
     #: Swing only from at least this distance (``0`` = swing at any range).
-    min_attack_px: float = 56.0
+    min_attack_px: float = 60.0
     #: Post-swing cooldown (seconds) that makes a close-range swing safe.
     safe_cooldown_s: float = 0.3
+    #: Enemies inside this radius count as "the group" (outnumbered → focus fire).
+    group_radius_px: float = 320.0
     #: Portal distance (iso cells) at which ``interact`` is pulsed.
     portal_interact_cells: float = 0.7
+    #: Distance (iso cells) at which portal-seeking hands over to a local sweep.
+    portal_search_cells: float = 2.5
     #: Portal distance (iso cells) at which the policy stops walking in.
-    portal_brake_cells: float = 0.35
+    portal_brake_cells: float = 0.0
 
 
 DEFAULT_CONFIG = HeuristicConfig()
@@ -84,10 +96,21 @@ def heuristic_action(
 
     portal = resolved.portal(obs)
     if portal.active:
+        # Walk in until the portal's own Area2D fires: braking early leaves the
+        # player parked outside the trigger, and doorway hopping would tour the
+        # floor instead of entering the room the portal is in.
         move = _step_toward(resolved, grid, portal.rel_cells, previous)
         interact = 1 if portal.distance_cells <= config.portal_interact_cells else 0
-        brake = portal.distance_cells <= config.portal_brake_cells
+        brake = 0.0 < portal.distance_cells <= config.portal_brake_cells
         return _action(0 if brake else move, 0, interact)
+
+    if portal.distance_cells > config.portal_search_cells:
+        # Nothing perceived yet. The exit portal's bearing is always published
+        # (``docs/07`` §5.7) and it sits on the far side of the floor from the
+        # spawn, so walking its way sweeps the map's long axis — a much better
+        # search than a local frontier crawl, which loops once the 21x21 window
+        # around the player is explored.
+        return _action(_travel(resolved, grid, portal.rel_cells, previous), 0, 0)
 
     return _action(_explore_step(resolved, grid, previous), 0, 0)
 
@@ -102,6 +125,7 @@ def _fight(
     enemies: Sequence[EnemySlot],
     config: HeuristicConfig,
     previous: int = 0,
+    portal: PortalFeatures | None = None,
 ) -> np.ndarray:
     """Approach, strike and dodge the perceived enemies (``docs/07`` §9.4).
 
@@ -110,11 +134,14 @@ def _fight(
     policy dodges the most dangerous one instead of tunnel-visioning on the
     closest target.
     """
-    threat = _incoming_threat(enemies, config)
-    if threat is not None:
-        escape = _retreat_step(layout, grid, screen_delta(threat.rel_cells), previous)
-        return _action(0 if escape is None else escape, 0, 0)
     enemy = enemies[0]
+    close = [slot for slot in enemies if slot.screen_distance_px <= config.group_radius_px]
+    if len(close) < 2:
+        # One enemy: the duel dance (dodge the telegraph, strike the recovery).
+        threat = _incoming_threat(enemies, config)
+        if threat is not None:
+            escape = _retreat_step(layout, grid, screen_delta(threat.rel_cells), previous)
+            return _action(0 if escape is None else escape, 0, 0)
     screen = screen_delta(enemy.rel_cells)
     distance_px = float(np.hypot(*screen)) * PX_PER_CELL
     toward = _steer(layout, screen, previous)
@@ -142,7 +169,8 @@ def _fight(
         # on its post-swing cooldown. Swinging from point blank otherwise is a
         # guaranteed trade, and 12 trades is the whole health bar.
         safe = (
-            enemy.state in ("recover", "stagger")
+            len(close) >= 2
+            or enemy.state in ("recover", "stagger")
             or enemy.attack_cooldown_s >= config.safe_cooldown_s
         )
         if distance_px >= config.min_attack_px or safe:
@@ -153,13 +181,48 @@ def _fight(
             if escape is not None:
                 return _action(escape, 0, 0)
 
-    move = _step_toward(layout, grid, enemy.rel_cells, previous)
+    if (
+        portal is not None
+        and not portal.active
+        and portal.distance_cells > config.portal_search_cells
+        and not _engaged(enemies, config)
+        and not _locally_reachable(layout, grid, enemy.rel_cells)
+    ):
+        # The enemy is walled off and the local window has nothing left to
+        # explore: walking at it parks the player against the wall between
+        # them. Head for the exit portal instead — it is on the far side of the
+        # floor, so that route leaves the room and eventually crosses the
+        # enemy's.
+        return _action(_step_toward(layout, grid, portal.rel_cells, previous), 0, 0)
+    move = _step_toward(
+        layout,
+        grid,
+        enemy.rel_cells,
+        previous,
+        avoid_reversal=not _engaged(enemies, config),
+    )
     if move == 0 and distance_px > 1.0:
         # Inside half a grid cell the rounded BFS target is our own cell; steer
         # with the exact screen direction instead (this is what turns the
         # facing, and the swing locks the facing).
         move = toward
     return _action(move, 0, 0)
+
+
+def _locally_reachable(layout: Layout, grid: np.ndarray, target_cells: Any) -> bool:
+    """True when the target cell is inside the local window and reachable."""
+    target = (int(round(float(target_cells[0]))), int(round(float(target_cells[1]))))
+    if max(abs(target[0]), abs(target[1])) > layout.grid_radius:
+        return False
+    paths = _bfs(layout, grid)
+    if target in paths:
+        return True
+    return bool(frontier_open(layout, grid))
+
+
+def _engaged(enemies: Sequence[EnemySlot], config: HeuristicConfig) -> bool:
+    """True while at least one enemy is inside the engagement radius."""
+    return any(slot.screen_distance_px <= config.group_radius_px for slot in enemies)
 
 
 def _incoming_threat(enemies: Sequence[EnemySlot], config: HeuristicConfig) -> EnemySlot | None:
@@ -274,7 +337,59 @@ def _flee_hazard(layout: Layout, grid: np.ndarray) -> int | None:
     return best_index
 
 
-def _step_toward(layout: Layout, grid: np.ndarray, target_cells: Any, previous: int = 0) -> int:
+def _travel(layout: Layout, grid: np.ndarray, target_cells: Any, previous: int = 0) -> int:
+    """Long-range travel: hop doorway to doorway, then walk the last cells.
+
+    Rooms and corridors are only connected through door cells, so a greedy
+    straight-line walk parks against a wall as soon as the route bends. For a
+    target more than a couple of cells away the nearest doorway that points at
+    the target is the reliable next waypoint; inside a couple of cells the
+    direct BFS step is exact.
+    """
+    distance = float(np.hypot(*screen_delta(target_cells)))
+    if distance > 3.0:
+        step = _doorway_step(layout, grid, target_cells, previous)
+        if step is not None:
+            return step
+    return _step_toward(layout, grid, target_cells, previous)
+
+
+def _doorway_step(
+    layout: Layout, grid: np.ndarray, target_cells: Any, previous: int = 0
+) -> int | None:
+    """First step toward the reachable doorway closest to the target."""
+    paths = _bfs(layout, grid)
+    target = (
+        int(round(float(target_cells[0]))),
+        int(round(float(target_cells[1]))),
+    )
+    doorways = [
+        cell
+        for cell in paths
+        if cell != (0, 0) and layout.cell(grid, cell[0], cell[1], "doorway") > 0.5
+    ]
+    if not doorways:
+        return None
+    cell = min(
+        doorways,
+        key=lambda item: (
+            round(_distance_to(item, target), 6),
+            paths[item][1],
+            item[0],
+            item[1],
+        ),
+    )
+    return _no_reversal(paths[cell][0], previous, layout, grid)
+
+
+def _step_toward(
+    layout: Layout,
+    grid: np.ndarray,
+    target_cells: Any,
+    previous: int = 0,
+    *,
+    avoid_reversal: bool = True,
+) -> int:
     """Wall-aware first step toward a grid-cell delta (BFS over the local grid).
 
     When the target is inside the window and reachable, the step is on a
@@ -291,7 +406,10 @@ def _step_toward(layout: Layout, grid: np.ndarray, target_cells: Any, previous: 
         return 0
     paths = _bfs(layout, grid)
     if target in paths:
-        return _sticky(paths[target][0], previous, layout, grid)
+        step = _sticky(paths[target][0], previous, layout, grid)
+        if not avoid_reversal:
+            return step
+        return _no_reversal(step, previous, layout, grid)
     frontier = [
         (cell, path)
         for cell, path in paths.items()
@@ -307,7 +425,32 @@ def _step_toward(layout: Layout, grid: np.ndarray, target_cells: Any, previous: 
                 item[0][1],
             ),
         )
-        return path[0]
+        if not avoid_reversal:
+            return path[0]
+        return _no_reversal(path[0], previous, layout, grid)
+    # No frontier left: leave the room. Door cells are the only exits, so head
+    # for the doorway that points most directly at the target instead of
+    # hugging the wall between us and it (which is a local trap: the route
+    # around a wall usually leaves the 21x21 window).
+    doorways = [
+        cell
+        for cell in paths
+        if cell != (0, 0) and layout.cell(grid, cell[0], cell[1], "doorway") > 0.5
+    ]
+    if doorways:
+        cell = min(
+            doorways,
+            key=lambda item: (
+                round(_distance_to(item, target), 6),
+                paths[item][1],
+                item[0],
+                item[1],
+            ),
+        )
+        step = paths[cell][0]
+        if not avoid_reversal:
+            return step
+        return _no_reversal(step, previous, layout, grid)
     # Fully explored / boxed in: head to the reachable cell closest to the
     # target side of the window instead of standing still.
     candidates = [(cell, path) for cell, path in paths.items() if cell != (0, 0)]
@@ -322,7 +465,9 @@ def _step_toward(layout: Layout, grid: np.ndarray, target_cells: Any, previous: 
             item[0][1],
         ),
     )
-    return path[0]
+    if not avoid_reversal:
+        return path[0]
+    return _no_reversal(path[0], previous, layout, grid)
 
 
 def _explore_step(layout: Layout, grid: np.ndarray, previous: int = 0) -> int:
@@ -332,7 +477,7 @@ def _explore_step(layout: Layout, grid: np.ndarray, previous: int = 0) -> int:
         if cell == (0, 0):
             continue
         if layout.visited(grid, cell[0], cell[1]) < 0.5:
-            return path[0]
+            return _no_reversal(path[0], previous, layout, grid)
     # Fully explored window (or boxed in): push to the farthest reachable cell.
     candidates = [(cell, path) for cell, path in paths.items() if cell != (0, 0)]
     if not candidates:
@@ -345,7 +490,15 @@ def _explore_step(layout: Layout, grid: np.ndarray, previous: int = 0) -> int:
             -item[0][1],
         ),
     )
-    return path[0]
+    return _no_reversal(path[0], previous, layout, grid)
+
+
+def frontier_open(layout: Layout, grid: np.ndarray) -> bool:
+    """True when the local grid still has a reachable, unvisited cell."""
+    for cell in _bfs(layout, grid):
+        if cell != (0, 0) and layout.visited(grid, cell[0], cell[1]) < 0.5:
+            return True
+    return False
 
 
 def _bfs(layout: Layout, grid: np.ndarray) -> dict[tuple[int, int], tuple[int, int]]:
@@ -395,6 +548,25 @@ def _sticky(step: int, previous: int, layout: Layout, grid: np.ndarray) -> int:
     if candidate.screen[0] * chosen.screen[0] + candidate.screen[1] * chosen.screen[1] <= 0.0:
         return step
     return previous
+
+
+def _no_reversal(chosen: int, previous: int, layout: Layout, grid: np.ndarray) -> int:
+    """Refuse to reverse the walking direction for a single window.
+
+    A frontier target that is one cell behind the player makes the pure policy
+    alternate "step toward" and "step back" every cell, which cancels out into a
+    permanent two-cell loop. Keeping the previous direction (when it is a legal
+    step) breaks the cycle; the next recomputation sees a changed terrain
+    window and picks a genuinely new frontier.
+    """
+    if not previous or previous == chosen or not (0 < previous < len(layout.actions)):
+        return chosen
+    if layout.opposite_move(previous) != chosen:
+        return chosen
+    spec = layout.actions[previous]
+    if spec.moving and _step_is_free(layout, grid, spec.grid):
+        return previous
+    return chosen
 
 
 def _distance_to(cell: tuple[int, int], target: tuple[int, int]) -> float:
@@ -467,14 +639,20 @@ class HeuristicPolicy:
         layout: Layout,
         config: HeuristicConfig = DEFAULT_CONFIG,
         *,
-        no_progress_windows: int = 12,
+        no_progress_windows: int = 10,
+        loop_window: int = 40,
     ) -> None:
         self.layout = layout
         self.config = config
         self.no_progress_windows = int(no_progress_windows)
+        self.loop_window = int(loop_window)
         self._last_cell: tuple[float, float] | None = None
         self._waiting = 0
         self._rotation = 0
+        self._sweep = 0
+        self._sweep_wait = 0
+        self._recent: deque[tuple[float, float]] = deque(maxlen=loop_window)
+        self._sweep_latched = False
 
     def __call__(
         self, obs: np.ndarray, info: Mapping[str, Any] | None = None, layout: Layout | None = None
@@ -484,7 +662,36 @@ class HeuristicPolicy:
         cell = resolved.player_features(obs).cell_fraction
         moving = int(action[0]) != 0
         enemies = resolved.perceived_enemies(obs)
-        if enemies or not moving:
+        engaged = any(slot.screen_distance_px <= self.config.group_radius_px for slot in enemies)
+        destination = bool(enemies) or resolved.portal(obs).active
+        if engaged or destination:
+            # A target is visible (an enemy, or the open exit portal), so the
+            # greedy core is in charge: the sweep only exists to escape a local
+            # trap while blind. Leaving it latched once a destination appears is
+            # what made cleared floors tour the map instead of using the portal.
+            self._sweep = 0
+            self._sweep_wait = 0
+            self._sweep_latched = False
+            self._recent.clear()
+        elif self._sweep_latched:
+            # Keep the committed heading until an enemy is engaged again: a
+            # single "no move" window from the greedy core must not drop it.
+            self._sweep_wait = 0
+        elif frontier_open(resolved, resolved.grid(obs)):
+            self._sweep = 0
+            self._sweep_wait = 0
+        else:
+            # The whole local window is explored, so "nearest frontier" has
+            # nothing left to aim at and the greedy "closest cell to the
+            # target" fallback parks the player against the wall between it and
+            # the target. Hold the current heading for a long stretch and only
+            # turn when it is blocked: that walks the floor (and out of the
+            # local window) until a new frontier or the target route appears.
+            self._sweep_wait += 1
+            if self._sweep_wait >= 3:
+                self._sweep = self._sweep or int(action[0])
+                self._sweep_wait = 0
+        if engaged or not moving:
             # Combat footwork and deliberate standing still are not "stuck".
             self._waiting = 0
             self._rotation = 0
@@ -494,12 +701,37 @@ class HeuristicPolicy:
             self._waiting = 0
             self._rotation = max(self._rotation - 1, 0)
         self._last_cell = cell
+        if self._sweep:
+            action = action.copy()
+            action[0] = self._sweep
         if self._rotation:
             action = action.copy()
             action[0] = _rotate_move(int(action[0]), self._rotation)
         if self._waiting >= self.no_progress_windows:
-            self._rotation = (self._rotation + 1) % 8
+            # Scan the other seven axes (0 would retry the blocked direction).
+            if self._sweep:
+                self._sweep = _rotate_move(self._sweep, 1)
+            else:
+                self._rotation = (self._rotation % 7) + 1
             self._waiting = 0
+        if not engaged:
+            # Cell-level progress check: a two-cell bounce changes the cell on
+            # every window, so the "no cell change" counter above cannot see a
+            # loop. Counting the distinct cells of the last few seconds does.
+            self._recent.append(cell)
+            limit = max(3, self.loop_window // 8)
+            if len(self._recent) == self.loop_window and len(set(self._recent)) <= limit:
+                self._recent.clear()
+                if self._sweep:
+                    self._sweep = _rotate_move(self._sweep, 2)
+                else:
+                    # Latch a committed heading: from here on the policy walks
+                    # like a wall follower (turn on block) until an enemy is
+                    # engaged again, instead of re-running the greedy local
+                    # choice that produced the loop.
+                    self._sweep_latched = True
+                    self._sweep = int(action[0]) or 1
+                self._waiting = 0
         return action
 
 

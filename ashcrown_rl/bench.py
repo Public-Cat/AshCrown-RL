@@ -36,7 +36,17 @@ from .launch import (
 )
 from .protocol import DEFAULT_TIMEOUT, GodotError
 
-CSV_COLUMNS = ("env", "mode", "steps", "seconds", "steps_per_s", "obs_len", "seed", "commit")
+CSV_COLUMNS = (
+    "env",
+    "mode",
+    "env_count",
+    "steps",
+    "seconds",
+    "steps_per_s",
+    "obs_len",
+    "seed",
+    "commit",
+)
 #: Deterministic action stream: four move directions, attack every other step.
 MOVE_CYCLE = (1, 3, 5, 7)
 
@@ -54,6 +64,7 @@ class BenchResult:
     commit: str
     episodes: int
     startup_seconds: float
+    env_count: int = 1
 
     @property
     def steps_per_s(self) -> float:
@@ -64,6 +75,7 @@ class BenchResult:
         return {
             "env": self.env,
             "mode": self.mode,
+            "env_count": self.env_count,
             "steps": self.steps,
             "seconds": f"{self.seconds:.3f}",
             "steps_per_s": f"{self.steps_per_s:.1f}",
@@ -76,6 +88,7 @@ class BenchResult:
         return {
             "env": self.env,
             "mode": self.mode,
+            "env_count": self.env_count,
             "steps": self.steps,
             "seconds": round(self.seconds, 3),
             "steps_per_s": round(self.steps_per_s, 1),
@@ -194,6 +207,66 @@ def run_benchmark(
         process.close()
 
 
+def run_vec_benchmark(
+    *,
+    n_envs: int,
+    steps: int,
+    seed: int,
+    level: int = 1,
+    character: str = "warrior",
+    frame_skip: int = 4,
+    env_label: str = "source",
+    game_project: Path | None = None,
+    godot_bin: str | None = None,
+) -> BenchResult:
+    """Measure aggregate steps/s of ``n_envs`` AshCrown processes (RL-4).
+
+    ``steps`` is counted per environment (so the aggregate is
+    ``steps * n_envs / seconds``); process startup and the first reset are
+    outside the measured window.
+    """
+    from .vec import make_vec_env
+
+    configuration = {"level": level, "character": character, "frame_skip": frame_skip}
+    if game_project is not None:
+        configuration["project"] = str(game_project)
+    if godot_bin is not None:
+        configuration["godot_bin"] = godot_bin
+    started = time.perf_counter()
+    env = make_vec_env(int(n_envs), int(seed), env_kwargs=configuration)
+    try:
+        obs, _ = env.reset()
+        startup_seconds = time.perf_counter() - started
+        obs_len = int(env.single_observation_space.shape[0])
+        move_cycle = np.array(MOVE_CYCLE, dtype=np.int64)
+        actions = np.zeros((int(n_envs), 3), dtype=np.int64)
+        measured = time.perf_counter()
+        for index in range(int(steps)):
+            actions[:, 0] = move_cycle[index % len(move_cycle)]
+            actions[:, 1] = 1 if index % 2 == 0 else 0
+            obs, rewards, terminated, truncated, _infos = env.step(actions)
+            if obs.shape != (n_envs, obs_len):
+                raise AssertionError(f"batched observation shape {obs.shape} is wrong")
+            if not np.all(np.isfinite(obs)):
+                raise AssertionError(f"step {index}: observation holds a non-finite value")
+            del rewards, terminated, truncated
+        elapsed = time.perf_counter() - measured
+    finally:
+        env.close()
+    return BenchResult(
+        env=env_label,
+        mode="level",
+        steps=int(steps) * int(n_envs),
+        seconds=elapsed,
+        obs_len=obs_len,
+        seed=int(seed),
+        commit=game_commit(game_project),
+        episodes=1,
+        startup_seconds=startup_seconds,
+        env_count=int(n_envs),
+    )
+
+
 def _check_observation(obs: np.ndarray, obs_len: int, label: str) -> None:
     if obs.size != obs_len:
         raise AssertionError(f"{label}: observation has {obs.size} floats, expected {obs_len}")
@@ -232,6 +305,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--godot-bin", default=None, help="godot binary (default: auto)")
     parser.add_argument("--exported-binary", default=None, help="run an exported Linux binary")
     parser.add_argument("--env-label", default=None, help="CSV env label (source|exported|...)")
+    parser.add_argument(
+        "--envs",
+        type=int,
+        default=1,
+        help="parallel environments (1 = single-process benchmark, RL-3)",
+    )
     parser.add_argument("--csv", default=None, help="append the row to this CSV file")
     return parser.parse_args(argv)
 
@@ -239,6 +318,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point; returns the process exit code."""
     args = parse_args(argv)
+    if args.envs > 1:
+        try:
+            vector_result = run_vec_benchmark(
+                n_envs=args.envs,
+                steps=args.steps,
+                seed=args.seed,
+                level=args.level,
+                character=args.character,
+                frame_skip=args.frame_skip,
+                env_label=args.env_label or "source",
+                game_project=(
+                    Path(args.game_project).expanduser()
+                    if args.game_project
+                    else default_game_project()
+                ),
+                godot_bin=args.godot_bin,
+            )
+        except (GodotUnavailable, GodotProcessError, GodotError, AssertionError) as exc:
+            print(f"BENCH_FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        if args.csv:
+            append_csv(Path(args.csv), vector_result)
+        print("BENCH " + json.dumps(vector_result.summary(), sort_keys=True))
+        return 0
     config = build_config(args)
     try:
         result = run_benchmark(

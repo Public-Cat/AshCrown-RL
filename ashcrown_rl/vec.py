@@ -108,8 +108,10 @@ def make_vec_env(
         master = int(np.random.SeedSequence().entropy)
     else:
         master = int(seed)
-    children = np.random.SeedSequence(master).spawn(int(n_envs))
-    env_fns = [_make_worker_env(dict(kwargs), child) for child in children]
+    env_fns = [
+        _make_worker_env(dict(kwargs), np.random.SeedSequence(worker_seed))
+        for worker_seed in worker_seeds(master, int(n_envs))
+    ]
     return AshCrownVectorEnv(
         env_fns,
         shared_memory=False,
@@ -130,8 +132,15 @@ def _make_worker_env(kwargs: dict[str, Any], seed_sequence: np.random.SeedSequen
 
 
 def worker_seeds(seed: int, n_envs: int) -> list[int]:
-    """The per-worker master entropies used by :func:`make_vec_env`."""
-    return [int(child.entropy) for child in np.random.SeedSequence(int(seed)).spawn(n_envs)]
+    """The per-worker seed entropies used by :func:`make_vec_env`.
+
+    ``SeedSequence(master).spawn(n)`` gives every worker a distinct child
+    sequence; the child's ``entropy`` is the *parent's* entropy (identical for
+    all children), so the worker seed is the first 32-bit state of the child.
+    The mapping is deterministic for a given master seed.
+    """
+    children = np.random.SeedSequence(int(seed)).spawn(int(n_envs))
+    return [int(child.generate_state(1, dtype=np.uint32)[0]) for child in children]
 
 
 __all__ = [

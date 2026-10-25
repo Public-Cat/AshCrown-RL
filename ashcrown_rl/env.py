@@ -291,6 +291,12 @@ class AshCrownEnv(gym.Env):
         if terminated or truncated:
             self._episode_done = True
         info = self._enrich(result.info)
+        # The engine's ``episode`` counter grows with every reset, so leaving it
+        # in the step info would make two identical seeded episodes report
+        # different infos (Gymnasium's ``check_env`` determinism check compares
+        # them). It is reported on reset, where it belongs.
+        info.pop("episode", None)
+        info["episode_seed"] = self._episode_seed
         info["episode_steps"] = self._episode_steps
         info["episode_return"] = self._episode_return
         return (
@@ -405,7 +411,11 @@ class AshCrownEnv(gym.Env):
         enriched["action_schema"] = self._layout.action_schema
         enriched["layout_hash"] = self.layout_hash
         enriched["obs_len"] = self.obs_len
-        enriched["layout_slices"] = self._layout_slices
+        # Fresh objects per call: Gymnasium rejects infos that share objects
+        # between calls (a caller may keep and mutate them).
+        enriched["layout_slices"] = {
+            name: list(bounds) for name, bounds in self._layout_slices.items()
+        }
         enriched["frame_skip"] = self.frame_skip
         enriched["mode"] = self.mode
         return enriched
