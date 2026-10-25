@@ -32,6 +32,7 @@ import numpy as np
 from gymnasium.vector import AsyncVectorEnv, AutoresetMode
 
 from .env import AshCrownEnv
+from .history import resolve_frame_stack, wrap_frame_stack
 
 #: ``AsyncVectorEnv`` worker function type (kept as a permissive alias).
 DEFAULT_CONTEXT = "spawn"
@@ -133,22 +134,27 @@ def make_vec_env(
     env_kwargs: dict[str, Any] | None = None,
     context: str = DEFAULT_CONTEXT,
     daemon: bool = True,
+    frame_stack: int = 1,
 ) -> AshCrownVectorEnv:
     """Build ``n_envs`` AshCrown environments, one Godot process each.
 
     ``env_kwargs`` is forwarded to :class:`AshCrownEnv` (``level``,
     ``frame_skip``, ``character``, ``project``, …). ``seed=None`` draws one
     master seed from OS entropy; pass an ``int`` for a reproducible rollout.
+    ``frame_stack > 1`` stacks the last ``k`` observations **inside each worker**
+    (``docs/07`` §5.7), so both the training policy and the collectors see the
+    same ``(k, obs_len)`` observation the evaluator rebuilds.
     """
     if int(n_envs) < 1:
         raise ValueError(f"n_envs={n_envs!r} must be >= 1")
+    stack = resolve_frame_stack(frame_stack)
     kwargs = dict(env_kwargs or {})
     if seed is None:
         master = int(np.random.SeedSequence().entropy)
     else:
         master = int(seed)
     env_fns = [
-        _make_worker_env(dict(kwargs), np.random.SeedSequence(worker_seed))
+        _make_worker_env(dict(kwargs), np.random.SeedSequence(worker_seed), stack)
         for worker_seed in worker_seeds(master, int(n_envs))
     ]
     # ``AsyncVectorEnv.__init__`` builds one env in *this* process from
@@ -172,11 +178,20 @@ def make_vec_env(
     return vec
 
 
-def _make_worker_env(kwargs: dict[str, Any], seed_sequence: np.random.SeedSequence) -> Any:
+def _make_worker_env(
+    kwargs: dict[str, Any],
+    seed_sequence: np.random.SeedSequence,
+    frame_stack: int = 1,
+) -> Any:
     """Picklable ``env_fn`` for one worker (spawn-safe: no closures over envs)."""
+    stack = resolve_frame_stack(frame_stack)
 
-    def _factory() -> SeededAshCrownEnv:
-        return SeededAshCrownEnv(AshCrownEnv(**kwargs), seed_sequence)
+    def _factory() -> Any:
+        env: Any = SeededAshCrownEnv(AshCrownEnv(**kwargs), seed_sequence)
+        # Outermost on purpose: the stack must be the last wrapper so the
+        # published observation is the stacked one and no other wrapper has to
+        # know about it.
+        return wrap_frame_stack(env, stack)
 
     return _factory
 

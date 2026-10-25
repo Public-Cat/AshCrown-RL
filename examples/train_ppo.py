@@ -27,6 +27,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ashcrown_rl.history import resolve_frame_stack  # noqa: E402
 from ashcrown_rl.train import train_ppo  # noqa: E402
 
 
@@ -95,6 +96,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perception-px", type=float, default=900.0)
     parser.add_argument("--expose-portal", default=None, help="true | false")
     parser.add_argument("--obs-blocked", action="store_true", help="add the blocked grid channel")
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=None,
+        help="observation history length k (docs/07 §5.7; default 4)",
+    )
     parser.add_argument("--n-steps", type=int, default=2048, help="rollout steps per env")
     parser.add_argument("--batch-size", type=int, default=512, help="PPO minibatch size")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -237,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             "explore_coef": args.explore_coef,
             "approach_coef": args.approach_coef,
         },
+        frame_stack=resolve_frame_stack(args.frame_stack),
         save_freq=args.save_freq,
         eval_seeds={
             "train_master": int(args.seed),

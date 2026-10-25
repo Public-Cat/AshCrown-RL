@@ -38,7 +38,8 @@ from bc_pretrain import collect  # noqa: E402
 from stable_baselines3 import PPO  # noqa: E402
 
 from ashcrown_rl.env import AshCrownEnv  # noqa: E402
-from ashcrown_rl.train import read_metadata  # noqa: E402
+from ashcrown_rl.history import stack_indices, stack_observations  # noqa: E402
+from ashcrown_rl.train import checkpoint_frame_stack, read_metadata  # noqa: E402
 
 #: Human-readable names of the three ``ashcrown-act-v1`` heads.
 HEADS: tuple[str, ...] = ("move", "attack", "interact")
@@ -188,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
         report["config"] = verify_config(checkpoint, env_kwargs)
         print("BC_CONFIG " + json.dumps(report["config"]), flush=True)
     model = PPO.load(str(checkpoint), device="cpu")
+    # The policy's input is `frame_stack x obs_len`; stored rows are raw frames,
+    # so rebuild the same window the checkpoint was trained on.
+    stack = checkpoint_frame_stack(checkpoint)
     if args.dataset:
         from ashcrown_rl.dagger import SOURCE_DAGGER, SOURCE_DEMO, load_dataset  # noqa: PLC0415
 
@@ -200,13 +204,19 @@ def main(argv: list[str] | None = None) -> int:
             rows = np.flatnonzero(keep)[-int(args.tail) :]
             keep = np.zeros(dataset.samples, dtype=bool)
             keep[rows] = True
+        rows_obs = dataset.obs[keep]
+        if dataset.episode_ids is not None:
+            rows_obs = stack_observations(
+                rows_obs, stack_indices(dataset.episode_ids[keep], stack)
+            )
         report["dataset"] = {
             "path": str(args.dataset),
             "source": args.source,
             "tail": int(args.tail),
+            "frame_stack": stack,
             **measure(
                 model,
-                dataset.obs[keep],
+                rows_obs,
                 dataset.actions[keep],
                 confusion=True,
             ),
@@ -220,9 +230,14 @@ def main(argv: list[str] | None = None) -> int:
     for label, seed in (("held_out", args.seed), ("train", args.check_train_seed)):
         if seed is None:
             continue
-        observations, actions = collect(
-            n_envs=args.n_envs, steps=args.steps, seed=int(seed), env_kwargs=env_kwargs
+        observations, actions, episodes, _stats = collect(
+            n_envs=args.n_envs,
+            steps=args.steps,
+            seed=int(seed),
+            env_kwargs=env_kwargs,
+            frame_stack=stack,
         )
+        observations = stack_observations(observations, stack_indices(episodes, stack))
         report[label] = {"seed": int(seed), **measure(model, observations, actions)}
         print(f"BC_{label.upper()} " + json.dumps(report[label]), flush=True)
     if args.out:

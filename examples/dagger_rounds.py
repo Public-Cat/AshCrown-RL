@@ -53,6 +53,12 @@ from ashcrown_rl.dagger import (  # noqa: E402
 )
 from ashcrown_rl.env import AshCrownEnv  # noqa: E402
 from ashcrown_rl.evaluate import evaluate_ppo, expand_seed_ranges  # noqa: E402
+from ashcrown_rl.history import (  # noqa: E402
+    policy_obs_len,
+    resolve_frame_stack,
+    stack_indices,
+    stack_observations,
+)
 from ashcrown_rl.protocol import ProtocolError  # noqa: E402
 from ashcrown_rl.train import (  # noqa: E402
     METADATA_VERSION,
@@ -96,6 +102,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--net-arch", default="256,256")
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=None,
+        help="observation history length k (docs/07 §5.7; default 4)",
+    )
     parser.add_argument("--weight-cap", type=float, default=10.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -149,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         "project": args.game_project,
     }
     net_arch = [int(value) for value in str(args.net_arch).replace(",", " ").split()]
+    stack = resolve_frame_stack(args.frame_stack)
     epochs = int(args.epochs) if args.epochs is not None else (10 if iteration == 0 else 4)
     checkpoint = _checkpoint_path(work_dir, iteration)
     previous = _checkpoint_path(work_dir, iteration - 1)
@@ -162,11 +175,12 @@ def main(argv: list[str] | None = None) -> int:
         # ---- the held-out demonstrator set (fixed across rounds) -----------
         if not _val_path(work_dir).is_file():
             started = time.perf_counter()
-            val_obs, val_actions, val_stats = collect(
+            val_obs, val_actions, val_episodes, val_stats = collect(
                 n_envs=int(args.n_envs),
                 steps=int(args.val_steps),
                 seed=int(args.val_seed),
                 env_kwargs=env_kwargs,
+                frame_stack=stack,
             )
             save_dataset(
                 _val_path(work_dir),
@@ -174,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     obs=val_obs,
                     actions=val_actions,
                     sources=np.full(len(val_obs), SOURCE_DEMO, dtype=np.int8),
+                    episode_ids=val_episodes,
                 ),
             )
             print(
@@ -184,32 +199,43 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         val = load_dataset(_val_path(work_dir))
+        val_stacked = stack_observations(
+            val.obs,
+            stack_indices(val.episode_ids, stack) if val.episode_ids is not None else None,
+        )
 
         # ---- collect this round's labels -----------------------------------
         started = time.perf_counter()
         dataset = load_dataset(_dataset_path(work_dir)) if iteration > 0 else None
         if iteration == 0:
-            new_obs, new_actions, new_stats = collect(
+            new_obs, new_actions, new_episodes, new_stats = collect(
                 n_envs=int(args.n_envs),
                 steps=int(args.demo_steps),
                 seed=int(args.seed),
                 env_kwargs=env_kwargs,
+                frame_stack=stack,
             )
             source = SOURCE_DEMO
         else:
             if not previous.is_file():
                 raise ValueError(f"missing previous checkpoint {previous}")
             student = PPO.load(str(previous), device=args.device)
-            new_obs, new_actions, new_stats = collect_dagger(
+            new_obs, new_actions, new_episodes, new_stats = collect_dagger(
                 model=student,
                 n_envs=int(args.n_envs),
                 steps=int(args.dagger_steps),
                 seed=int(args.seed) + int(args.dagger_seed_step) * iteration,
                 env_kwargs=env_kwargs,
                 stochastic=not args.dagger_deterministic,
+                frame_stack=stack,
+                episode_offset=int(dataset.episode_ids.max()) + 1
+                if dataset is not None and dataset.episode_ids is not None
+                else 0,
             )
             source = SOURCE_DAGGER
-        dataset = append_samples(dataset, new_obs, new_actions, source=source)
+        dataset = append_samples(
+            dataset, new_obs, new_actions, source=source, episode_ids=new_episodes
+        )
         save_dataset(_dataset_path(work_dir), dataset)
         collect_s = time.perf_counter() - started
         print(
@@ -229,6 +255,25 @@ def main(argv: list[str] | None = None) -> int:
         # ---- retrain (class-weighted per-head CE, optionally continuing) ---
         started = time.perf_counter()
         weights = head_weights(dataset.actions, classes, args.weight_cap)
+        stack_index = (
+            stack_indices(dataset.episode_ids, stack)
+            if dataset.episode_ids is not None
+            else None
+        )
+        print(
+            "DAGGER_STACK "
+            + json.dumps(
+                {
+                    "iteration": iteration,
+                    "frame_stack": stack,
+                    "stored_obs_shape": list(dataset.obs.shape[1:]),
+                    "fit_input_rows": list(stack_index.shape) if stack_index is not None else None,
+                    "policy_obs_len": policy_obs_len(int(dataset.obs.shape[1]), stack),
+                    "val_stacked_shape": list(val_stacked.shape[1:]),
+                }
+            ),
+            flush=True,
+        )
         initial = None
         if iteration == 0 and args.init_checkpoint:
             initial = PPO.load(str(args.init_checkpoint), device=args.device)
@@ -245,10 +290,25 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             model=initial,
             weights=weights if args.weight_cap > 1.0 else None,
+            frame_stack=stack,
+            stack_index=stack_index,
         )
         model.save(str(checkpoint))
         fit_s = time.perf_counter() - started
-        report = head_report(model, val.obs, val.actions, device=args.device)
+        effective = int(np.prod(model.observation_space.shape))
+        print(
+            "DAGGER_INPUT "
+            + json.dumps(
+                {
+                    "iteration": iteration,
+                    "policy_observation_space": list(model.observation_space.shape),
+                    "policy_input_len": effective,
+                    "expected": policy_obs_len(int(dataset.obs.shape[1]), stack),
+                }
+            ),
+            flush=True,
+        )
+        report = head_report(model, val_stacked, val.actions, device=args.device)
         print("DAGGER_ACCURACY " + json.dumps({"iteration": iteration, **report}), flush=True)
 
         probe = AshCrownEnv(**env_kwargs)
@@ -267,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
                     "observation_config": probe.observation_config(),
                     "frame_skip": probe.frame_skip,
                     "samples": dataset.samples,
+                    "frame_stack": int(stack),
+                    "policy_obs_len": policy_obs_len(int(dataset.obs.shape[1]), stack),
                     "demo_samples": dataset.demo_samples,
                     "dagger_samples": dataset.dagger_samples,
                     "epochs": epochs,

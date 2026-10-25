@@ -59,6 +59,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvIndices
 
 from .env import AshCrownEnv
+from .history import policy_obs_len, resolve_frame_stack, wrap_frame_stack
 from .vec import (
     DEFAULT_CONTEXT,
     AshCrownVectorEnv,
@@ -183,8 +184,17 @@ def verify_metadata(
     obs_schema: str | None,
     layout_hash: str | None,
     observation_config: Mapping[str, Any] | None,
+    frame_stack: int | None = None,
+    obs_len: int | None = None,
 ) -> None:
-    """Refuse a checkpoint whose environment contract differs from the live one."""
+    """Refuse a checkpoint whose environment contract differs from the live one.
+
+    ``frame_stack``/``obs_len`` guard the observation *history* (``docs/07``
+    §5.7): the policy's input is ``frame_stack × obs_len`` floats, so a
+    checkpoint trained on a 4-frame stack must not be loaded against a 1-frame
+    environment (or against a different stack length). Checkpoints written
+    before the stack existed have no ``frame_stack`` key and mean 1.
+    """
     if protocol is not None and metadata.get("protocol") != protocol:
         raise MetadataMismatch(
             f"checkpoint protocol {metadata.get('protocol')!r} != live {protocol!r}"
@@ -202,6 +212,25 @@ def verify_metadata(
         live = dict(observation_config)
         if recorded != live:
             raise MetadataMismatch(f"checkpoint observation_config {recorded!r} != live {live!r}")
+    if frame_stack is not None:
+        recorded_stack = int(metadata.get("frame_stack", 1) or 1)
+        live_stack = resolve_frame_stack(frame_stack)
+        if recorded_stack != live_stack:
+            raise MetadataMismatch(
+                f"checkpoint frame_stack {recorded_stack} != requested {live_stack}"
+                " (a stacked policy cannot be evaluated single-frame)"
+            )
+    if obs_len is not None:
+        recorded_len = int(
+            metadata.get("policy_obs_len")
+            or policy_obs_len(int(metadata.get("obs_len", obs_len)), metadata.get("frame_stack", 1))
+        )
+        expected = policy_obs_len(int(obs_len), int(metadata.get("frame_stack", 1) or 1))
+        if recorded_len != expected:
+            raise MetadataMismatch(
+                f"checkpoint policy_obs_len {recorded_len} != live {expected}"
+                f" ({metadata.get('frame_stack', 1)} frame(s) x {int(obs_len)})"
+            )
 
 
 def load_policy(
@@ -209,6 +238,7 @@ def load_policy(
     env: AshCrownEnv | None = None,
     *,
     device: str = "cpu",
+    frame_stack: int | None = None,
 ) -> PPO:
     """Load a PPO checkpoint after verifying its metadata against ``env``."""
     metadata = read_metadata(checkpoint)
@@ -219,8 +249,15 @@ def load_policy(
             obs_schema=env.hello.get("obs_schema") or env.layout.obs_schema,
             layout_hash=env.layout_hash,
             observation_config=env.observation_config(),
+            frame_stack=frame_stack,
+            obs_len=env.obs_len,
         )
     return PPO.load(str(checkpoint), device=device)
+
+
+def checkpoint_frame_stack(checkpoint: str | Path) -> int:
+    """The frame-stack length a checkpoint was trained (or fitted) with."""
+    return resolve_frame_stack(read_metadata(checkpoint).get("frame_stack", 1))
 
 
 # --------------------------------------------------------------------------- #
@@ -690,16 +727,22 @@ def make_training_vec_env(
     env_kwargs: Mapping[str, Any],
     levels: Sequence[int] | None = None,
     shaping: Mapping[str, float] | None = None,
+    frame_stack: int = 1,
 ) -> Sb3AshCrownVecEnv:
-    """Build the SB3 vector env (optionally level-scheduled and shaped)."""
+    """Build the SB3 vector env (optionally level-scheduled, shaped, stacked)."""
     kwargs = dict(env_kwargs)
+    stack = resolve_frame_stack(frame_stack)
     shaping_active = any(float(value) for value in dict(shaping or {}).values())
     if not levels and not shaping_active:
-        return Sb3AshCrownVecEnv(make_vec_env(int(n_envs), seed=int(seed), env_kwargs=kwargs))
+        return Sb3AshCrownVecEnv(
+            make_vec_env(int(n_envs), seed=int(seed), env_kwargs=kwargs, frame_stack=stack)
+        )
     # Mixed-level training: every auto-reset draws the next level of the
     # schedule, so the level cannot be pinned by the rollout loop.
     env_fns = [
-        _curriculum_worker_factory(dict(kwargs), int(worker_seed), list(levels or []), shaping)
+        _curriculum_worker_factory(
+            dict(kwargs), int(worker_seed), list(levels or []), shaping, stack
+        )
         for worker_seed in worker_seeds(int(seed), int(n_envs))
     ]
     probe = ProbeSink()
@@ -725,17 +768,21 @@ def _curriculum_worker_factory(
     worker_seed: int,
     levels: list[int],
     shaping: Mapping[str, float] | None = None,
+    frame_stack: int = 1,
 ) -> Any:
-    """Picklable ``env_fn`` building a level-scheduled, shaped worker env."""
+    """Picklable ``env_fn`` building a level-scheduled, shaped, stacked worker env."""
     seed_sequence = np.random.SeedSequence(worker_seed)
     shaping_kwargs = dict(shaping or {})
+    stack = resolve_frame_stack(frame_stack)
 
     def _factory() -> Any:
         seeder = SeededAshCrownEnv(AshCrownEnv(**kwargs), seed_sequence)
         env: Any = CurriculumEnv(seeder, levels) if levels else seeder
         if any(float(value) for value in shaping_kwargs.values()):
             env = ShapingWrapper(env, **shaping_kwargs)
-        return env
+        # Outermost: the stack is the published observation, the shaping
+        # potential keeps reading the raw frame.
+        return wrap_frame_stack(env, stack)
 
     return _factory
 
@@ -758,6 +805,7 @@ def train_ppo(
     device: str = "cpu",
     levels: Sequence[int] | None = None,
     shaping: Mapping[str, float] | None = None,
+    frame_stack: int = 1,
     save_freq: int = 100_000,
     eval_seeds: Mapping[str, Any] | None = None,
     git_paths: Mapping[str, str | Path] | None = None,
@@ -770,6 +818,7 @@ def train_ppo(
         env_kwargs=env_kwargs,
         levels=levels,
         shaping=shaping,
+        frame_stack=frame_stack,
     )
     metadata_factory: Callable[[int], dict[str, Any]]
     try:
@@ -784,7 +833,12 @@ def train_ppo(
             "layout_hash": vec.get_attr("layout_hash")[0],
             "obs_len": int(vec.get_attr("obs_len")[0]),
             "observation_config": vec.env_method("observation_config")[0],
+            # The stack lives on the Python side only (§5.7): the engine obs and
+            # the layout hash are untouched, so the policy input size is the
+            # product and both halves are recorded.
+            "frame_stack": resolve_frame_stack(frame_stack),
         }
+        pins["policy_obs_len"] = policy_obs_len(pins["obs_len"], pins["frame_stack"])
 
         def metadata_factory(steps: int) -> dict[str, Any]:
             return {
@@ -873,6 +927,7 @@ __all__ = [
     "Sb3AshCrownVecEnv",
     "TrainingCurveCallback",
     "build_metadata",
+    "checkpoint_frame_stack",
     "git_commit",
     "load_policy",
     "make_training_vec_env",

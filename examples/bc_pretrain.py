@@ -45,6 +45,11 @@ from stable_baselines3 import PPO  # noqa: E402
 
 from ashcrown_rl.baseline import HeuristicPolicy  # noqa: E402
 from ashcrown_rl.env import AshCrownEnv  # noqa: E402
+from ashcrown_rl.history import (  # noqa: E402
+    policy_obs_len,
+    resolve_frame_stack,
+    stack_indices,
+)
 from ashcrown_rl.protocol import ProtocolError  # noqa: E402
 from ashcrown_rl.train import (  # noqa: E402
     METADATA_VERSION,
@@ -76,17 +81,28 @@ def collect(
     steps: int,
     seed: int,
     env_kwargs: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Roll the heuristic on ``n_envs`` processes and return ``(obs, actions, stats)``.
+    frame_stack: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Roll the heuristic on ``n_envs`` processes and label its own states.
 
-    Each row is ``(observation at decision t, action the heuristic chose at that
-    same observation)`` — the pairing is built in one statement per step, before
-    the environment is advanced, so no off-by-one is possible.
+    Returns ``(raw_obs, actions, episode_ids, stats)``. Each row is
+    ``(observation at decision t, action the heuristic chose at that same
+    observation)`` — the pairing is built in one statement per step, before the
+    environment is advanced, so no off-by-one is possible.
+
+    With ``frame_stack > 1`` the *worker env* publishes the stacked window; only
+    the newest frame (``obs[:, -1]``) is stored, together with the collection
+    episode id, and
+    :func:`~ashcrown_rl.history.stack_indices` rebuilds the identical window at
+    fit time (see :mod:`ashcrown_rl.dagger`).
     """
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
-    vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs)
-    stats = {"episodes": 0, "clears": 0}
+    episodes: list[np.ndarray] = []
+    stack = resolve_frame_stack(frame_stack)
+    counters = np.zeros(int(n_envs), dtype=np.int64)
+    vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs, frame_stack=stack)
+    stats = {"episodes": 0, "clears": 0, "frame_stack": stack}
     try:
         probe = AshCrownEnv(**env_kwargs)
         try:
@@ -97,14 +113,16 @@ def collect(
         collected = 0
         while collected < int(steps):
             actions_batch = _label_batch(policies, obs, infos, int(n_envs))
-            observations.append(np.asarray(obs, dtype=np.float32).copy())
+            observations.append(_raw_frame(obs))
             actions.append(actions_batch)
+            episodes.append(counters.copy())
             collected += int(n_envs)
             obs, _rewards, terminated, _truncated, infos = vec.step(actions_batch)
             stats["episodes"] += int(np.sum(terminated))
             stats["clears"] += _clear_count(infos, int(n_envs))
             for index in range(int(n_envs)):
                 if int(_env_info(infos, index).get("episode_steps", 1) or 0) == 0:
+                    counters[index] += 1
                     # Auto-reset: the demonstrator's memory (nav map, pocket
                     # guard, sweep ring) belongs to the *previous* level. Leaking
                     # it across episodes measurably breaks the demonstrator —
@@ -113,7 +131,20 @@ def collect(
                     policies[index] = HeuristicPolicy(policies[index].layout)
     finally:
         vec.close()
-    return np.concatenate(observations), np.concatenate(actions), stats
+    return (
+        np.concatenate(observations),
+        np.concatenate(actions),
+        np.concatenate(episodes),
+        stats,
+    )
+
+
+def _raw_frame(obs: Any) -> np.ndarray:
+    """The newest raw frame of a (possibly stacked) batched observation."""
+    values = np.asarray(obs, dtype=np.float32)
+    if values.ndim == 3:  # (n_envs, frame_stack, obs_len)
+        return values[:, -1, :].copy()
+    return values.copy()
 
 
 def _clear_count(infos: Any, n_envs: int) -> int:
@@ -143,12 +174,17 @@ def collect_dagger(
     seed: int,
     env_kwargs: dict[str, Any],
     stochastic: bool = True,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    frame_stack: int = 1,
+    episode_offset: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Roll ``model`` and label its own visited states with the heuristic (DAgger)."""
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
-    vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs)
-    stats = {"episodes": 0, "clears": 0}
+    episodes: list[np.ndarray] = []
+    stack = resolve_frame_stack(frame_stack)
+    counters = np.zeros(int(n_envs), dtype=np.int64) + int(episode_offset)
+    vec = make_vec_env(int(n_envs), seed=int(seed), env_kwargs=env_kwargs, frame_stack=stack)
+    stats = {"episodes": 0, "clears": 0, "frame_stack": stack}
     try:
         probe = AshCrownEnv(**env_kwargs)
         try:
@@ -167,8 +203,9 @@ def collect_dagger(
                     for index in range(int(n_envs))
                 ]
             ).astype(np.int64)
-            observations.append(np.asarray(obs, dtype=np.float32).copy())
+            observations.append(_raw_frame(obs))
             actions.append(labels)
+            episodes.append(counters.copy())
             collected += int(n_envs)
             obs, _rewards, terminated, _truncated, infos = vec.step(executed)
             stats["episodes"] += int(np.sum(terminated))
@@ -179,9 +216,15 @@ def collect_dagger(
                     # Auto-reset happened for this env: the heuristic's memory
                     # (nav map, pocket guard, sweep) belongs to the old episode.
                     policies[index] = HeuristicPolicy(policies[index].layout)
+                    counters[index] += 1
     finally:
         vec.close()
-    return np.concatenate(observations), np.concatenate(actions), stats
+    return (
+        np.concatenate(observations),
+        np.concatenate(actions),
+        np.concatenate(episodes),
+        stats,
+    )
 
 
 def head_weights(
@@ -224,11 +267,21 @@ def fit(
     device: str = "cpu",
     model: PPO | None = None,
     weights: list[np.ndarray] | None = None,
+    frame_stack: int = 1,
+    stack_index: np.ndarray | None = None,
 ) -> PPO:
-    """Fit the policy's action heads to ``actions`` by (weighted) cross-entropy."""
+    """Fit the policy's action heads to ``actions`` by (weighted) cross-entropy.
+
+    ``stack_index`` (from :func:`~ashcrown_rl.history.stack_indices`) turns the
+    stored **raw** observations into the ``(k, obs_len)`` windows the policy was
+    trained on; without it the rows are fed single-frame.
+    """
+    stack = resolve_frame_stack(frame_stack)
     if model is None:
         env_kwargs = {"level": 1, "frame_skip": 4, "max_ticks": 600}
-        vec = make_training_vec_env(n_envs=1, seed=int(seed), env_kwargs=env_kwargs)
+        vec = make_training_vec_env(
+            n_envs=1, seed=int(seed), env_kwargs=env_kwargs, frame_stack=stack
+        )
         try:
             model = PPO(
                 "MlpPolicy",
@@ -256,7 +309,11 @@ def fit(
         total = 0.0
         for start in range(0, count, int(batch_size)):
             batch = order[start : start + int(batch_size)]
-            heads = model.policy.get_distribution(obs_tensor[batch]).distribution
+            if stack_index is not None:
+                window = stack_index[batch].reshape(-1)
+            else:
+                window = batch
+            heads = model.policy.get_distribution(obs_tensor[window]).distribution
             losses = []
             for index, head in enumerate(heads):
                 log_prob = head.log_prob(action_tensor[batch, index])
@@ -295,6 +352,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--net-arch", default="256,256")
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=None,
+        help="observation history length k (docs/07 §5.7; default 4)",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--weight-cap",
@@ -332,10 +395,16 @@ def main(argv: list[str] | None = None) -> int:
         "project": args.game_project,
     }
     net_arch = [int(value) for value in str(args.net_arch).replace(",", " ").split()]
+    stack = resolve_frame_stack(args.frame_stack)
     try:
-        observations, actions, collect_stats = collect(
-            n_envs=args.n_envs, steps=args.steps, seed=args.seed, env_kwargs=env_kwargs
+        observations, actions, episode_ids, collect_stats = collect(
+            n_envs=args.n_envs,
+            steps=args.steps,
+            seed=args.seed,
+            env_kwargs=env_kwargs,
+            frame_stack=stack,
         )
+        stack_index = stack_indices(episode_ids, stack)
         probe = AshCrownEnv(**env_kwargs)
         try:
             classes = [int(value) for value in probe.action_space.nvec]
@@ -347,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "samples": int(len(observations)),
                     "obs_len": int(observations.shape[1]),
+                    "frame_stack": stack,
+                    "policy_obs_len": policy_obs_len(int(observations.shape[1]), stack),
                     "stats": collect_stats,
                     "labels": label_stats(actions, classes),
                 }
@@ -376,18 +447,24 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             model=initial,
             weights=weights if args.weight_cap > 1.0 else None,
+            frame_stack=stack,
+            stack_index=stack_index,
         )
         for round_index in range(int(args.dagger_rounds)):
-            new_obs, new_actions, stats = collect_dagger(
+            new_obs, new_actions, new_episodes, stats = collect_dagger(
                 model=model,
                 n_envs=args.n_envs,
                 steps=args.dagger_steps,
                 seed=int(args.seed) + 1000 + round_index,
                 env_kwargs=env_kwargs,
                 stochastic=not args.dagger_deterministic,
+                frame_stack=stack,
+                episode_offset=int(episode_ids.max()) + 1 if episode_ids.size else 0,
             )
             observations = np.concatenate([observations, new_obs])
             actions = np.concatenate([actions, new_actions])
+            episode_ids = np.concatenate([episode_ids, new_episodes])
+            stack_index = stack_indices(episode_ids, stack)
             print(
                 "BC_DAGGER "
                 + json.dumps(
@@ -413,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
                 device=args.device,
                 model=model,
                 weights=weights if args.weight_cap > 1.0 else None,
+                frame_stack=stack,
+                stack_index=stack_index,
             )
     except (ProtocolError, OSError, ValueError) as exc:
         print(f"BC_FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -435,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
                 "observation_config": probe.observation_config(),
                 "frame_skip": probe.frame_skip,
                 "samples": int(len(observations)),
+                "frame_stack": int(stack),
+                "policy_obs_len": policy_obs_len(int(observations.shape[1]), stack),
                 "epochs": int(args.epochs),
                 "weight_cap": float(args.weight_cap),
                 "dagger_rounds": int(args.dagger_rounds),

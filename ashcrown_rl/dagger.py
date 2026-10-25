@@ -64,16 +64,32 @@ ROUND_COLUMNS: tuple[str, ...] = (
 
 @dataclass
 class Dataset:
-    """An aggregate DAgger dataset (observations, expert actions, provenance)."""
+    """An aggregate DAgger dataset (observations, expert actions, provenance).
+
+    ``obs`` always holds the **raw** engine observation (``obs_len`` floats);
+    ``episode_ids`` records which collection episode each row came from, so the
+    observation-history stack (``docs/07`` §5.7) can be rebuilt with
+    :func:`~ashcrown_rl.history.stack_indices` at fit time instead of storing a
+    ``k × obs_len`` stack for every row (that would be a 4× disk cost on the
+    192 k-row aggregate). ``episode_ids`` is optional so datasets written before
+    the stack existed still load.
+    """
 
     obs: np.ndarray
     actions: np.ndarray
     sources: np.ndarray
+    episode_ids: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.obs = np.asarray(self.obs, dtype=np.float32)
         self.actions = np.asarray(self.actions, dtype=np.int64)
         self.sources = np.asarray(self.sources, dtype=np.int8)
+        if self.episode_ids is not None:
+            self.episode_ids = np.asarray(self.episode_ids, dtype=np.int64)
+            if self.episode_ids.shape[0] != self.obs.shape[0]:
+                raise ValueError(
+                    f"obs rows {self.obs.shape[0]} != episode rows {self.episode_ids.shape[0]}"
+                )
         if self.obs.shape[0] != self.actions.shape[0]:
             raise ValueError(
                 f"obs rows {self.obs.shape[0]} != action rows {self.actions.shape[0]}"
@@ -112,12 +128,14 @@ def save_dataset(path: str | Path, dataset: Dataset) -> Path:
     """Write ``dataset`` to ``path`` (``.npz``) and return the path."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        target,
-        obs=dataset.obs,
-        actions=dataset.actions,
-        sources=dataset.sources,
-    )
+    payload: dict[str, Any] = {
+        "obs": dataset.obs,
+        "actions": dataset.actions,
+        "sources": dataset.sources,
+    }
+    if dataset.episode_ids is not None:
+        payload["episode_ids"] = dataset.episode_ids
+    np.savez_compressed(target, **payload)
     return target
 
 
@@ -128,6 +146,7 @@ def load_dataset(path: str | Path) -> Dataset:
             obs=payload["obs"],
             actions=payload["actions"],
             sources=payload["sources"],
+            episode_ids=payload["episode_ids"] if "episode_ids" in payload else None,
         )
 
 
@@ -137,6 +156,7 @@ def append_samples(
     actions: np.ndarray,
     *,
     source: int,
+    episode_ids: np.ndarray | None = None,
 ) -> Dataset:
     """Aggregate ``(obs, actions)`` onto ``dataset`` (DAgger aggregation step).
 
@@ -148,16 +168,41 @@ def append_samples(
     new_obs = np.asarray(obs, dtype=np.float32)
     new_actions = np.asarray(actions, dtype=np.int64)
     new_sources = np.full(new_obs.shape[0], int(source), dtype=np.int8)
+    new_episodes = (
+        np.asarray(episode_ids, dtype=np.int64).reshape(-1)
+        if episode_ids is not None
+        else None
+    )
     if dataset is None:
-        return Dataset(obs=new_obs, actions=new_actions, sources=new_sources)
+        return Dataset(
+            obs=new_obs, actions=new_actions, sources=new_sources, episode_ids=new_episodes
+        )
     if new_obs.shape[1:] != dataset.obs.shape[1:]:
         raise ValueError(
             f"observation shape {new_obs.shape[1:]} != aggregate {dataset.obs.shape[1:]}"
         )
+    # Episode ids stay unique across rounds: offset the new block past the
+    # aggregate's largest id so a stack never spans two collection rounds.
+    combined_episodes = None
+    if new_episodes is not None:
+        offset = (
+            int(dataset.episode_ids.max()) + 1
+            if dataset.episode_ids is not None and dataset.episode_ids.size
+            else 0
+        )
+        previous = (
+            dataset.episode_ids
+            if dataset.episode_ids is not None
+            else np.arange(dataset.obs.shape[0], dtype=np.int64)
+        )
+        combined_episodes = np.concatenate([previous, new_episodes + offset])
+    elif dataset.episode_ids is not None:  # pragma: no cover - mixed provenance
+        raise ValueError("cannot append rows without episode ids to a dataset that has them")
     return Dataset(
         obs=np.concatenate([dataset.obs, new_obs]),
         actions=np.concatenate([dataset.actions, new_actions]),
         sources=np.concatenate([dataset.sources, new_sources]),
+        episode_ids=combined_episodes,
     )
 
 

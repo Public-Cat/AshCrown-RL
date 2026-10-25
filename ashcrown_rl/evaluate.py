@@ -55,6 +55,7 @@ import numpy as np
 from .baseline import DEFAULT_CONFIG as HEURISTIC_CONFIG
 from .baseline import HeuristicPolicy, heuristic_action
 from .env import AshCrownEnv
+from .history import DEFAULT_FRAME_STACK, ObsStack, episode_marker, resolve_frame_stack
 from .protocol import ProtocolError
 from .spaces import Layout
 
@@ -92,11 +93,33 @@ POLICIES: Mapping[str, Policy] = {
 }
 
 
-def ppo_model_policy(model: Any) -> Policy:
-    """Wrap a loaded Stable-Baselines3 model as an evaluation policy."""
+def ppo_model_policy(model: Any, frame_stack: int = 1) -> Policy:
+    """Wrap a loaded Stable-Baselines3 model as an evaluation policy.
+
+    ``frame_stack > 1`` reproduces the training observation exactly: a
+    per-episode :class:`~ashcrown_rl.history.ObsStack` whose window is reset from
+    ``info`` (``episode`` id / ``tick == 0``) before the first prediction of an
+    episode, so no frame leaks across episodes — the same "reset value repeated"
+    padding Gymnasium's ``FrameStackObservation`` applies.
+    """
+    stack_size = resolve_frame_stack(frame_stack)
+    state: dict[str, Any] = {
+        "marker": None,
+        "stack": ObsStack(stack_size) if stack_size > 1 else None,
+    }
 
     def _policy(obs: np.ndarray, info: Mapping[str, Any], layout: Layout) -> list[int]:
-        action, _state = model.predict(obs, deterministic=True)
+        stack = state["stack"]
+        if stack is not None:
+            marker = episode_marker(info)
+            if state["marker"] is None or marker[1] or marker[0] != state["marker"]:
+                stacked = stack.reset(obs)
+                state["marker"] = marker
+            else:
+                stacked = stack.push(obs)
+            action, _state = model.predict(stacked, deterministic=True)
+        else:
+            action, _state = model.predict(obs, deterministic=True)
         return [int(value) for value in action]
 
     return _policy
@@ -110,6 +133,7 @@ def resolve_policy(
     checkpoint: str | None = None,
     env: AshCrownEnv | None = None,
     model: Any = None,
+    frame_stack: int | None = None,
 ) -> Policy:
     """Policy callable for ``--policy``.
 
@@ -121,13 +145,20 @@ def resolve_policy(
     """
     if name == "ppo":
         trained = model
+        if checkpoint and frame_stack is None:
+            # Default to the stack the checkpoint was trained with: a stacked
+            # policy evaluated single-frame is the failure mode the metadata
+            # check exists to prevent.
+            from .train import checkpoint_frame_stack  # noqa: PLC0415
+
+            frame_stack = checkpoint_frame_stack(checkpoint)
         if trained is None:
             if not checkpoint:
                 raise ValueError("--policy ppo needs --checkpoint <model.zip>")
             from .train import load_policy  # noqa: PLC0415 - keeps numpy-only imports light
 
-            trained = load_policy(checkpoint, env)
-        return ppo_model_policy(trained)
+            trained = load_policy(checkpoint, env, frame_stack=frame_stack)
+        return ppo_model_policy(trained, resolve_frame_stack(frame_stack or 1))
     if name == "heuristic":
         if layout is None:
             raise ValueError("the heuristic policy needs the env layout")
@@ -513,7 +544,12 @@ def _ppo_chunk(payload: Mapping[str, Any], out: Any) -> None:  # pragma: no cove
                 if env is None or policy is None:
                     env = AshCrownEnv(**dict(payload["env_kwargs"]))
                     policy = resolve_policy(
-                        "ppo", 0, env.layout, checkpoint=str(payload["checkpoint"]), env=env
+                        "ppo",
+                        0,
+                        env.layout,
+                        checkpoint=str(payload["checkpoint"]),
+                        env=env,
+                        frame_stack=int(payload.get("frame_stack") or DEFAULT_FRAME_STACK),
                     )
                 if per_seed > 0.0:
                     watchdog = threading.Timer(per_seed, env.close)
@@ -715,6 +751,7 @@ def evaluate_ppo(
     out_path: str | Path | None = None,
     seed_timeout: float = DEFAULT_SEED_TIMEOUT,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    frame_stack: int | None = None,
     progress: bool = True,
 ) -> dict[str, Any]:
     """Fixed-seed PPO evaluation, optionally over ``workers`` processes.
@@ -729,11 +766,18 @@ def evaluate_ppo(
     started_wall = datetime.now(UTC).isoformat(timespec="seconds")
     clock = time.perf_counter()
     seeds = [int(seed) for seed in seeds]
+    if frame_stack is None:
+        from .train import checkpoint_frame_stack  # noqa: PLC0415 - numpy-only path
+
+        frame_stack = checkpoint_frame_stack(checkpoint)
+    stack_size = resolve_frame_stack(frame_stack)
     failures: list[dict[str, Any]] = []
     if int(workers) <= 1:
         env = AshCrownEnv(**dict(env_kwargs or {}))
         try:
-            policy = resolve_policy("ppo", 0, env.layout, checkpoint=checkpoint, env=env)
+            policy = resolve_policy(
+                "ppo", 0, env.layout, checkpoint=checkpoint, env=env, frame_stack=stack_size
+            )
             episodes = [
                 run_episode(
                     env,
@@ -770,6 +814,7 @@ def evaluate_ppo(
                 "options": dict(options or {}),
                 "max_steps": max_steps,
                 "seed_timeout": float(seed_timeout),
+                "frame_stack": stack_size,
             }
             for index, chunk in enumerate(chunks)
         ]
