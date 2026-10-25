@@ -83,10 +83,28 @@ change that bumps the game-side schema.
 
 ## Status
 
-Bootstrap only: package skeleton + uv project. The protocol client, Gymnasium
-environment and training scripts land in game tickets **RL-3** / **RL-4**;
-the bot/training pipeline is **RL-7**. The authoritative design is
-`docs/07-rl-headless-env-spec.md` in the game repository.
+**RL-3 landed**: `ashcrown_rl.protocol` (framing + `AshCrownClient`),
+`ashcrown_rl.launch` (source / exported-binary process launcher with port-file
+readiness and stderr capture) and `ashcrown_rl.bench` (the 1,000-step
+definition-of-done benchmark). The Gymnasium environment and training scripts
+land in **RL-4**; the bot/training pipeline is **RL-7**. The authoritative
+design is `docs/07-rl-headless-env-spec.md` in the game repository.
+
+```python
+from ashcrown_rl.launch import GodotProcess
+
+with GodotProcess() as process:          # launches godot, waits for RL_READY
+    client = process.connect()           # verifies protocol/obs schema/layout hash
+    obs, info = client.reset(seed=20260101)
+    obs, reward, terminated, truncated, info = client.step(move=2, attack=1)
+    client.close()                       # engine exits 0, no zombie
+```
+
+```bash
+uv run pytest -m "not integration"      # unit tests only
+uv run pytest                           # + real headless-engine tests
+uv run python -m ashcrown_rl.bench --steps 1000
+```
 
 ## Licence
 
