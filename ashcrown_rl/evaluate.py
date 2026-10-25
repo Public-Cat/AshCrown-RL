@@ -16,6 +16,21 @@ Episode metrics: ``level``, ``terminated``, ``truncated``, ``terminal_reason``,
 ``steps``, ``game_seconds``, ``return`` and the summed ``components`` (the
 engine's reward components). Aggregates: success rate, mean time, damage taken,
 stuck rate, terminal-reason counts and the protocol/obs-schema/layout pins.
+
+Combat instrumentation (RL-4 round 3): every episode also records the engine's
+``events.attacks_started`` / ``events.hits_landed`` counters and the number of
+decision windows in which the policy *requested* an attack, so the two ratios
+that were previously conflated are both reported:
+
+* ``hits_per_swing``  = ``hits_landed / attacks_started`` (the true land rate; a
+  started swing is one committed animation, ``attack_count``);
+* ``hits_per_request`` = ``hits_landed / attack_requests`` (diluted by every
+  held/queued attack request that could not start a new swing).
+
+``attack_requests`` is several times ``attacks_started`` whenever the policy
+holds the attack button: a swing locks the body for ~0.7 s ≈ 10 decision
+windows at ``frame_skip=4`` while each window produces one request, so a
+request-based ratio under-reports the land rate by design.
 """
 
 from __future__ import annotations
@@ -114,6 +129,9 @@ class EpisodeMetrics:
     damage_dealt: float = 0.0
     kills: int = 0
     player_hp: float = 0.0
+    attacks_started: int = 0
+    hits_landed: int = 0
+    attack_requests: int = 0
     state_hash: str = ""
     hashes: list[str] = field(default_factory=list)
     stuck_windows: int = 0
@@ -129,6 +147,16 @@ class EpisodeMetrics:
     def stuck(self) -> bool:
         """True when at least one 2 s window made no progress."""
         return self.stuck_windows > 0
+
+    @property
+    def hits_per_swing(self) -> float:
+        """Landed hits per committed swing (``0`` when no swing started)."""
+        return self.hits_landed / self.attacks_started if self.attacks_started else 0.0
+
+    @property
+    def hits_per_request(self) -> float:
+        """Landed hits per attack *request* window (``0`` when none)."""
+        return self.hits_landed / self.attack_requests if self.attack_requests else 0.0
 
     def as_dict(self, *, include_hashes: bool = False) -> dict[str, Any]:
         """JSON-ready episode record."""
@@ -149,6 +177,11 @@ class EpisodeMetrics:
             "damage_dealt": round(self.damage_dealt, 3),
             "kills": self.kills,
             "player_hp": round(self.player_hp, 3),
+            "attacks_started": self.attacks_started,
+            "hits_landed": self.hits_landed,
+            "attack_requests": self.attack_requests,
+            "hits_per_swing": round(self.hits_per_swing, 4),
+            "hits_per_request": round(self.hits_per_request, 4),
             "stuck_windows": self.stuck_windows,
             "windows": self.windows,
             "state_hash": self.state_hash,
@@ -187,6 +220,8 @@ def run_episode(
     frame_skip = env.frame_skip
     while True:
         action = policy(obs, info, layout)
+        if int(action[1]) == 1:
+            metrics.attack_requests += 1
         obs, reward, terminated, truncated, info = env.step(action)
         metrics.steps += 1
         metrics.episode_return += float(reward)
@@ -197,6 +232,8 @@ def run_episode(
         events = info.get("events") or {}
         metrics.damage_taken += float(events.get("damage_taken", 0.0))
         metrics.damage_dealt += float(events.get("damage_dealt", 0.0))
+        metrics.attacks_started += int(events.get("attacks_started", 0))
+        metrics.hits_landed += int(events.get("hits_landed", 0))
         window_damage += float(events.get("damage_dealt", 0.0)) + float(
             events.get("damage_taken", 0.0)
         )
@@ -247,6 +284,7 @@ def evaluate(
     repeat: int = 2,
     max_steps: int | None = None,
     with_hashes: bool = False,
+    csv_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate ``policy_name`` on every seed ``repeat`` times, twice-checked."""
     started_wall = datetime.now(UTC).isoformat(timespec="seconds")
@@ -293,6 +331,8 @@ def evaluate(
         }
         env_summary = _episode_summary(runs[0])
         determinism = _determinism(runs)
+        if csv_path is not None:
+            write_csv(csv_path, runs[0])
     finally:
         env.close()
     elapsed = time.perf_counter() - clock
@@ -350,6 +390,65 @@ def _episode_summary(episodes: Sequence[EpisodeMetrics]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# CSV artifact
+# --------------------------------------------------------------------------- #
+#: Column order of the per-episode combat CSV (``--csv``).
+CSV_COLUMNS: tuple[str, ...] = (
+    "seed",
+    "policy",
+    "level",
+    "terminal_reason",
+    "cleared",
+    "decisions",
+    "game_seconds",
+    "attacks_started",
+    "hits_landed",
+    "attack_requests",
+    "hits_per_swing",
+    "hits_per_request",
+    "damage_dealt",
+    "damage_taken",
+    "kills",
+    "hp_left",
+    "return",
+    "stuck_windows",
+    "windows",
+)
+
+
+def write_csv(path: str | Path, episodes: Sequence[EpisodeMetrics]) -> Path:
+    """Write the per-episode combat table (one row per episode)."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [",".join(CSV_COLUMNS)]
+    for metrics in episodes:
+        row = {
+            "seed": metrics.seed,
+            "policy": metrics.policy,
+            "level": metrics.level,
+            "terminal_reason": metrics.terminal_reason,
+            "cleared": int(metrics.cleared),
+            "decisions": metrics.steps,
+            "game_seconds": f"{metrics.game_seconds:.3f}",
+            "attacks_started": metrics.attacks_started,
+            "hits_landed": metrics.hits_landed,
+            "attack_requests": metrics.attack_requests,
+            "hits_per_swing": f"{metrics.hits_per_swing:.4f}",
+            "hits_per_request": f"{metrics.hits_per_request:.4f}",
+            "damage_dealt": f"{metrics.damage_dealt:.1f}",
+            "damage_taken": f"{metrics.damage_taken:.1f}",
+            "kills": metrics.kills,
+            "hp_left": f"{metrics.player_hp:.1f}",
+            "return": f"{metrics.episode_return:.3f}",
+            "stuck_windows": metrics.stuck_windows,
+            "windows": metrics.windows,
+        }
+        lines.append(",".join(str(row[column]) for column in CSV_COLUMNS))
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _parse_seeds(args: argparse.Namespace) -> list[int]:
@@ -379,6 +478,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--game-project", default=None, help="game checkout (default: auto)")
     parser.add_argument("--godot-bin", default=None, help="godot binary (default: auto)")
     parser.add_argument("--out", default=None, help="write the JSON report here")
+    parser.add_argument("--csv", default=None, help="write the per-episode combat CSV here")
     return parser
 
 
@@ -403,6 +503,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repeat=args.repeat,
             max_steps=args.max_steps,
             with_hashes=args.with_hashes,
+            csv_path=args.csv,
         )
     except (ProtocolError, OSError, ValueError) as exc:
         print(f"EVAL_FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -421,8 +522,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mean_game_seconds": report["aggregates"]["mean_game_seconds"],
         "deterministic": report["determinism"]["identical"],
         "out": args.out,
+        "csv": args.csv,
     }
     print("EVAL " + json.dumps(summary, sort_keys=True))
+    for episode in report["episodes"]:
+        print(
+            "EVAL_SEED "
+            + json.dumps(
+                {
+                    "seed": episode["seed"],
+                    "reason": episode["terminal_reason"],
+                    "decisions": episode["steps"],
+                    "seconds": episode["game_seconds"],
+                    "swings": episode["attacks_started"],
+                    "hits": episode["hits_landed"],
+                    "requests": episode["attack_requests"],
+                    "hits_per_swing": episode["hits_per_swing"],
+                    "hits_per_request": episode["hits_per_request"],
+                    "dmg_dealt": episode["damage_dealt"],
+                    "dmg_taken": episode["damage_taken"],
+                    "kills": episode["kills"],
+                    "hp": episode["player_hp"],
+                },
+                sort_keys=True,
+            )
+        )
     return 0 if report["determinism"]["identical"] else 2
 
 
