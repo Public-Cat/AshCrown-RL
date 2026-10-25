@@ -1,11 +1,11 @@
-"""Fixed-seed tuning sweep for the scripted baseline (RL-4 round 3).
+"""Fixed-seed tuning sweep for the scripted baseline (RL-4, rounds 3-4).
 
 Runs the same 10-seed acceptance protocol as
 ``python -m ashcrown_rl.evaluate`` for a list of :class:`HeuristicConfig`
 variants and prints one row per variant, so tuning is measured instead of
 guessed::
 
-    uv run python scripts/tune_baseline.py baseline kite_off standoff_low
+    uv run python -m scripts.tune_baseline baseline dodge_only recover
 
 Each variant is a name plus comma-separated ``field=value`` overrides on
 :class:`~ashcrown_rl.baseline.HeuristicConfig`. The default variant list lives in
@@ -27,13 +27,15 @@ from ashcrown_rl.evaluate import run_episode
 #: ``docs/artifacts/RL/RL4-report.md`` §"RL-4 round 3" are the measured history;
 #: this table lists the variants that still compile against the shipped config.
 VARIANTS: dict[str, dict[str, Any]] = {
+    # -- shipped configuration ------------------------------------------------ #
     "baseline": {},
+    # -- round 3 knobs (kept: they still compile against the shipped config) --- #
     "keepout16": {"keepout_slack_px": 16.0},
     "keepout20": {"keepout_slack_px": 20.0},
     "margin20": {"strike_margin_px": 20.0},
     "margin40": {"strike_margin_px": 40.0},
     "margin50": {"strike_margin_px": 50.0},
-    "margin60": {"strike_margin_px": 60.0},
+    "margin70": {"strike_margin_px": 70.0},
     "margin40_keepout16": {"strike_margin_px": 40.0, "keepout_slack_px": 16.0},
     "standoff_high": {"standoff_frac": 1.05},
     "standoff_low": {"standoff_frac": 0.75},
@@ -42,6 +44,53 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "no_doorway_retreat": {"doorway_retreat": False},
     "no_nav": {"local_approach_px": 600.0},
     "no_goal_memory": {"goal_memory_decisions": 0},
+    # -- round 4 pack-fighting micro, A/B one piece at a time ----------------- #
+    # The round-3 policy with every round-4 flag off (the acceptance baseline
+    # the last report shipped: 4/10 clears).
+    "round3": {
+        "strafe_dodge": False,
+        "chokepoint": False,
+        "isolate_target": False,
+        "pack_gate": False,
+        "queue_gate": False,
+        "reaction_s": 0.0,
+    },
+    # Perpendicular strafe only (the shipped dodge).
+    "dodge_only": {
+        "chokepoint": False,
+        "isolate_target": False,
+        "pack_gate": False,
+        "queue_gate": False,
+        "reaction_s": 0.0,
+    },
+    # Strafe + the pack damage gate (refuse a swing a second attacker can punish).
+    "pack_gate": {"strafe_dodge": False, "chokepoint": False, "isolate_target": False},
+    # Strafe + isolate the most isolated target.
+    "iso_only": {"strafe_dodge": False, "chokepoint": False, "pack_gate": False},
+    # Strafe + fight from the nearest doorway when 2+ attackers are on the body.
+    "choke_only": {"strafe_dodge": False, "isolate_target": False, "pack_gate": False},
+    "dodge_choke": {"isolate_target": False, "pack_gate": False, "queue_gate": False},
+    # Strafe + queue gate (swing only when every other attacker is a body behind).
+    "queue": {"isolate_target": False, "pack_gate": False},
+    # Strafe + punish only a telegraph/recovery (never a chasing enemy).
+    "recover": {
+        "chokepoint": False,
+        "isolate_target": False,
+        "pack_gate": False,
+        "queue_gate": False,
+        "punish_recover": True,
+    },
+    "dodge_react0": {"reaction_s": 0.0},
+    "dodge_side0": {"strafe_side": 0},
+    "hold_off": {"strafe_hold_bonus": 0.0},
+    "hold_free": {"strafe_hold_floor_px": 999.0},
+    "dodge35": {"dodge_window_s": 0.35},
+    "dodge60": {"dodge_window_s": 0.6},
+    "band16": {"strafe_band_px": 16.0},
+    "keepout18": {"keepout_slack_px": 18.0},
+    "margin60_dodge60": {"strike_margin_px": 60.0, "dodge_window_s": 0.6},
+    "dodge_hold55": {"standoff_min_px": 55.0, "chokepoint": False},
+    "dodge_hold62": {"standoff_min_px": 62.0, "chokepoint": False},
 }
 
 

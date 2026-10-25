@@ -544,6 +544,13 @@ class Layout:
                     is_boss=bool(row[index["is_boss"]] >= 0.5),
                     attack_reach_px=float(row[index["attack_reach"]]) * 200.0,
                     asleep=bool(row[index["asleep"]] >= 0.5),
+                    move_speed_px=float(row[index["move_speed"]]) * 500.0,
+                    damage=float(row[index["damage"]]) * 80.0,
+                    scale_mult=float(row[index["scale"]]) * 2.0,
+                    facing=(
+                        float(row[index["facing_cos"]]),
+                        float(row[index["facing_sin"]]),
+                    ),
                 )
             )
         return found
@@ -727,6 +734,15 @@ class EnemySlot:
     is_boss: bool
     attack_reach_px: float
     asleep: bool
+    #: ``EnemyDef.move_speed`` in screen px/s (``docs/07`` §5.4 feature 18).
+    move_speed_px: float = 0.0
+    #: ``EnemyDef.damage`` in HP per landed hit (feature 19).
+    damage: float = 0.0
+    #: ``EnemyDef.scale_mult`` (feature 39); the attack box is body-width wide
+    #: (``44 * scale``) when the def uses the oriented-box volume.
+    scale_mult: float = 1.0
+    #: Enemy facing as ``(cos, sin)`` in screen space (features 33/32).
+    facing: tuple[float, float] = (1.0, 0.0)
 
     @property
     def screen_delta_cells(self) -> np.ndarray:

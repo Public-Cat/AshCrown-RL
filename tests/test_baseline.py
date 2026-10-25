@@ -18,9 +18,13 @@ import pytest
 
 from ashcrown_rl.baseline import (
     DEFAULT_CONFIG,
+    ENEMY_TIMING,
     HeuristicConfig,
     HeuristicPolicy,
+    _enemy_timing,
+    _strafe_step,
     _swing_covers,
+    _time_to_hit,
     frontier_open,
     heuristic_action,
 )
@@ -123,7 +127,15 @@ def test_approaches_when_it_is_not_facing_the_enemy(layout: Layout, make_obs) ->
     assert action[0] != 0, "it steps to turn instead"
 
 
-def test_backs_off_during_the_windup(layout: Layout, make_obs) -> None:
+def test_circles_the_attacker_during_the_windup(layout: Layout, make_obs) -> None:
+    """Round 4: the answer to a telegraph is a *perpendicular* step, not a retreat.
+
+    The enemy's attack volume is an oriented box that freezes with its facing, so
+    backing away along the bearing stays inside it; a lateral step leaves it and
+    keeps the body in punish range (``scripts/trace_episode.py``: 87 % of skeleton
+    swings were still on the body at the active frames with the straight retreat,
+    and the lateral margin at that moment has a median of 24 px).
+    """
     obs = (
         make_obs()
         .fill_floor()
@@ -135,7 +147,8 @@ def test_backs_off_during_the_windup(layout: Layout, make_obs) -> None:
     enemy = layout.nearest_enemy(obs)
     assert enemy is not None
     assert action[1] == 0, "never trade into a telegraph"
-    assert _dot(action, layout, -enemy.screen_delta_cells) > 0.7, "steps away"
+    assert action[0] != 0, "it moves"
+    assert abs(_dot(action, layout, enemy.screen_delta_cells)) < 0.75, "not along the facing"
 
 
 def test_never_queues_a_second_swing(layout: Layout, make_obs) -> None:
@@ -370,6 +383,7 @@ def test_policy_keeps_fighting_instead_of_breaking_off(layout: Layout, make_obs)
     )
     core = heuristic_action(obs, {}, layout)
     assert core[1] == 0, "the telegraph is dodged, not traded"
+    assert core[0] != 0, "the dodge is a real step"
     info = {"action": [int(core[0]), 0, 0], "player_cell_offset": [0.0, 0.0], "stuck": False}
     assert policy(obs, info, layout).tolist() == core.tolist()
 
@@ -435,7 +449,7 @@ def test_backs_out_of_the_standoff_band_before_swinging(layout: Layout, make_obs
     )
     action = heuristic_action(obs, {}, layout)
     assert action[1] == 0
-    assert _dot(action, layout, -screen_delta((0.12, 0.0))) > 0.5
+    assert action[0] != 0, "it does not stand still at point blank"
 
 
 def test_interrupts_a_telegraph_that_is_still_early(layout: Layout, make_obs) -> None:
@@ -460,7 +474,8 @@ def test_dodges_a_telegraph_that_would_land_first(layout: Layout, make_obs) -> N
     )
     action = heuristic_action(obs, {}, layout)
     assert action[1] == 0
-    assert _dot(action, layout, -screen_delta((0.42, 0.0))) > 0.5
+    assert action[0] != 0, "it steps out of the frozen box"
+    assert abs(_dot(action, layout, screen_delta((0.42, 0.0)))) < 0.75
 
 
 def test_retreats_from_two_simultaneous_attacks(layout: Layout, make_obs) -> None:
@@ -540,3 +555,109 @@ def test_policy_remembers_a_target_that_left_perception(layout: Layout, make_obs
     second = policy(empty, info_with_offset(), layout)
     assert policy._goal is not None, "the goal survives a window without perception"
     assert second[0] != 0, "and the body keeps walking to it"
+
+
+# --------------------------------------------------------------------------- #
+# Round 4: pack-fighting micro (issue #94)
+# --------------------------------------------------------------------------- #
+def test_enemy_timing_table_matches_the_def_resources() -> None:
+    """The policy's timing table is the `.tres` data, not a guess."""
+    assert _enemy_timing("skeleton_normal") == (0.35, 0.30, 0.40)
+    assert _enemy_timing("skeleton_swift") == (0.20, 0.70, 0.35)
+    assert _enemy_timing("elite_skeleton") == (0.50, 0.40, 0.50)
+    assert _enemy_timing("slime_green") == (0.35, 0.15, 0.40)
+    assert _enemy_timing("nonsense") == ENEMY_TIMING["skeleton_normal"], "unknown types default"
+
+
+def test_time_to_hit_orders_windup_chase_and_recover(layout: Layout, make_obs) -> None:
+    """A live telegraph lands soonest; a chase must close first; recover waits."""
+
+    def timings(**enemy_kwargs: Any) -> float:
+        builder = make_obs().fill_floor().enemy(0, rel_cells=(0.9, 0.0), **enemy_kwargs)
+        builder.set_raw("enemies", "move_speed", 90.0)  # a skeleton_normal
+        obs = builder.player(facing=(1.0, 0.0)).build()
+        slot = layout.nearest_enemy(obs)
+        assert slot is not None
+        return _time_to_hit(slot, DEFAULT_CONFIG)
+
+    windup = timings(state="windup", windup_s=0.10)
+    chase = timings(state="chase")
+    recover = timings(state="recover")
+    assert windup == pytest.approx(0.10, abs=1e-3), "a telegraph is its remaining windup"
+    assert chase == pytest.approx((128.8 - 50.0) / 90.0 + 0.35, abs=0.05), "close, then wind up"
+    assert recover < chase, "a recovery only owes its remaining state + a windup"
+    assert windup < recover, "the telegraph is always the most immediate threat"
+    assert timings(state="stagger") > 90.0, "a staggered enemy cannot answer"
+
+
+def test_strafe_keeps_a_perpendicular_step_inside_the_band(layout: Layout, make_obs) -> None:
+    """The dodge steps sideways relative to the attacker, not away from it."""
+    obs = (
+        make_obs()
+        .fill_floor()
+        .enemy(0, rel_cells=(0.45, 0.0), state="windup", windup_s=0.2)
+        .player(facing=(1.0, 0.0))
+        .build()
+    )
+    slot = layout.nearest_enemy(obs)
+    assert slot is not None
+    step = _strafe_step(layout, layout.grid(obs), [slot], 0, DEFAULT_CONFIG)
+    assert step is not None, "there is always a lateral step in an open room"
+    direction = np.asarray(layout.actions[step].screen, dtype=np.float64)
+    bearing = np.asarray(slot.screen_delta_cells, dtype=np.float64)
+    bearing /= np.linalg.norm(bearing)
+    assert abs(float(direction @ bearing)) < 0.75, "the step is lateral, not along the facing"
+    # And it does not lunge into point blank.
+    after = np.asarray(slot.rel_cells, dtype=np.float64) - np.asarray(
+        layout.actions[step].grid, dtype=np.float64
+    )
+    assert float(np.hypot(*screen_delta(after))) * PX_PER_CELL >= 30.0
+
+
+def test_strafe_is_deterministic(layout: Layout, make_obs) -> None:
+    obs = (
+        make_obs()
+        .fill_floor()
+        .enemy(0, rel_cells=(0.45, 0.2), state="attack", hitbox_active=True)
+        .player(facing=(1.0, 0.0))
+        .build()
+    )
+    slot = layout.nearest_enemy(obs)
+    assert slot is not None
+    first = _strafe_step(layout, layout.grid(obs), [slot], 3, DEFAULT_CONFIG)
+    second = _strafe_step(layout, layout.grid(obs), [slot], 3, DEFAULT_CONFIG)
+    assert first == second
+
+
+def test_swing_gate_refuses_a_telegraph_that_lands_first(layout: Layout, make_obs) -> None:
+    """64 px is inside the enemy's reach + hurtbox envelope: no trade."""
+    obs = (
+        make_obs()
+        .fill_floor()
+        .enemy(0, rel_cells=(0.45, 0.0), state="windup", windup_s=0.1)
+        .player(facing=(1.0, 0.0))
+        .build()
+    )
+    assert heuristic_action(obs, {}, layout)[1] == 0
+
+    # The same distance in a *chase* state loses the race to our swing: it has to
+    # close first, so the hit is free and the policy takes it.
+    chasing = (
+        make_obs()
+        .fill_floor()
+        .enemy(0, rel_cells=(0.45, 0.0), state="chase")
+        .player(facing=(1.0, 0.0))
+        .build()
+    )
+    assert heuristic_action(chasing, {}, layout)[1] == 1
+
+
+def test_pack_gates_are_off_by_default() -> None:
+    """The measured-best configuration ships (see the report's tuning log)."""
+    assert DEFAULT_CONFIG.strafe_dodge is True
+    assert DEFAULT_CONFIG.strafe_side == 1
+    assert DEFAULT_CONFIG.strike_margin_px == 60.0
+    assert DEFAULT_CONFIG.pack_gate is False
+    assert DEFAULT_CONFIG.queue_gate is False
+    assert DEFAULT_CONFIG.chokepoint is False
+    assert DEFAULT_CONFIG.isolate_target is False

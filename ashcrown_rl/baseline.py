@@ -68,7 +68,12 @@ class HeuristicConfig:
     #: Measured on level 1 (``scripts/trace_episode.py``): every swing started
     #: inside 0-70 px landed (>= 100 % of the per-swing land rate), so the
     #: strike gate is reach + this margin rather than the old 60-69 px window.
-    strike_margin_px: float = 20.0
+    #: Round 4 swept it again on top of the perpendicular strafe: 20 / 50 / 60 /
+    #: 70 → 5 / 8 / **8** / 6 clears, so 60 ships. The extra 40 px are the
+    #: 63-65 px band where the exact swing-volume test already lands (the enemy
+    #: hurtbox is 22 px wide either side of its feet) but the old ``in_strike``
+    #: refused the swing.
+    strike_margin_px: float = 60.0
     #: Extra pixels on the enemy's reach that make a position dangerous. The
     #: enemy's swing volume reaches its ``attack_reach_px`` from its feet and the
     #: player's hurtbox adds ~22 px, so its threat radius is reach + ~22. The
@@ -80,6 +85,18 @@ class HeuristicConfig:
     #: Seconds between a swing start and its hitbox going live (0.375 x the
     #: warrior's 0.7 s swing); a telegraph is only interruptible beyond this.
     swing_land_s: float = 0.32
+    #: One decision window plus jitter (0.067 s at ``frame_skip=4``): the swing
+    #: starts on the *next* tick, so a race that is won by less than this is
+    #: lost. Measured on seed 8: ``windup_remaining=0.333`` was treated as a win
+    #: against a 0.32 s swing and the enemy's box went live first.
+    reaction_s: float = 0.0
+    #: Side of the perpendicular dodge: ``+1`` = clockwise, ``-1`` =
+    #: counter-clockwise, ``0`` = whichever side scores better this window. A
+    #: fixed side keeps consecutive steps circling the enemy; the free choice
+    #: flips as soon as the body crosses the bearing axis, which cancels the
+    #: strafe out (measured on seed 8: ``2,5,2`` alternating steps with the
+    #: enemy's box still on the body).
+    strafe_side: int = 1
     #: Windup assumed when a chasing enemy could start one this window.
     assumed_windup_s: float = 0.35
     #: Standoff band: swing only from at least this fraction of the enemy's own
@@ -111,6 +128,70 @@ class HeuristicConfig:
     pack_sidestep_px: float = 60.0
     #: Decisions a pack sidestep is held for.
     pack_sidestep_decisions: int = 2
+    #: **Round 4, pack-fighting micro.** Dodge a telegraphed swing by stepping
+    #: *perpendicular* to the attacker's bearing (circling it) instead of
+    #: backing straight away: the enemy's attack volume is an oriented box that
+    #: freezes with its facing at the end of the chase, so a lateral step leaves
+    #: it while a retreat along its facing stays inside. Measured on level 1
+    #: (``scripts/trace_episode.py``): the player walks 259 px/s against a
+    #: 103 px/s skeleton, and the lateral margin at the active frames has a
+    #: median of 24 px — one 45-degree step clears it.
+    strafe_dodge: bool = True
+    #: Seconds before an enemy's box can connect at which the body starts the
+    #: perpendicular step (one decision window is 0.067 s).
+    dodge_window_s: float = 0.45
+    #: Seconds the player's body is locked by a committed swing (0.7 s clip):
+    #: a swing is only safe when no enemy can land a hit inside this window.
+    swing_lock_s: float = 0.70
+    #: Distance (px) from an attacker the strafe tries to hold while circling
+    #: it, on top of its own reach: close enough to punish the recovery.
+    strafe_band_px: float = 8.0
+    #: Weight of the "distance drifted from the band" penalty in the strafe
+    #: score (px of lateral gain per px of drift).
+    strafe_drift_weight: float = 0.6
+    #: Score bonus (px) for continuing the previous strafe direction, so the
+    #: body circles instead of ping-ponging across the enemy's facing.
+    strafe_hold_bonus: float = 12.0
+    #: The hold bonus only applies while the step keeps the body within this many
+    #: px below the target band, so a "sidestep" can never also close the
+    #: distance into point blank.
+    strafe_hold_floor_px: float = 5.0
+    #: Fight from a doorway when two or more enemies can land a hit at once and
+    #: a doorway of the current room is this close (cells): a 2-cell doorway
+    #: funnels a pack into one attacker at a time.
+    doorway_max_cells: float = 6.0
+    #: Two or more enemies inside ``pack_reach_mult`` x the largest reach make a
+    #: room unsafe to fight in: relocate to the nearest doorway (chokepoint) and
+    #: fight there, one attacker at a time.
+    chokepoint: bool = False
+    #: Radius (x the largest perceived reach) that defines "the pack is on us".
+    pack_reach_mult: float = 1.5
+    #: Pick the *most isolated* target instead of the nearest wounded one: with
+    #: a 0.7 s swing lock the cheapest kill is the enemy whose pack-mates are
+    #: farthest away, not the closest body.
+    isolate_target: bool = False
+    #: Refuse a swing that a second attacker can punish inside the 0.7 s lock
+    #: unless the focus is already recovering/staggered (the cheapest trade).
+    #: Measured worse (0/10): it stops the swinging without ever opening the
+    #: distance, so the body just stands in the pack. Kept for the A/B log.
+    pack_gate: bool = False
+    #: **Queue gate.** A swing is only committed when *every* other perceived
+    #: enemy needs more than ``swing_lock_s`` to connect. In a pack that means
+    #: fighting the leader of the queue: the player runs 2.5x faster than a
+    #: skeleton, so a retreat lines the attackers up nose-to-tail (44 px apart)
+    #: and the second one is always a full body length behind the first.
+    queue_gate: bool = False
+    #: Distance (px) under which two or more attackers count as "the pack is on
+    #: the body": while the queue gate blocks the swing the policy opens the
+    #: distance instead of orbiting at point blank.
+    separate_px: float = 110.0
+    #: **Punish only a telegraph or a recovery.** The enemy's box reaches
+    #: ``attack_reach_px`` from its feet plus ~22 px of the player's hurtbox
+    #: (= 72 px for a skeleton) while the player's own strike reaches 63 px, so
+    #: a swing started at a *chasing* enemy always loses the race by ~0.05 s and
+    #: costs a hit. Waiting for the windup (which is frozen and cancelable) or
+    #: the 0.4 s recovery turns the same swing into a free hit.
+    punish_recover: bool = False
 
 
 DEFAULT_CONFIG = HeuristicConfig()
@@ -185,15 +266,28 @@ def _fight(
       seeds that died. So the body holds a **standoff band** (≈0.9 x the enemy's
       reach up to the player's own) and only swings from inside it.
 
+    Round 4 added the two measured *survival* facts (see the report):
+
+    * the player walks **259 px/s** while a chasing skeleton does 103 and a
+      slime 73, so distance is always recoverable and a 0.35 s telegraph is
+      always dodgeable;
+    * the enemy's attack volume is an **oriented box** that freezes with its
+      facing when the chase ends, and the player is inside that box on 87 % of
+      the skeleton's active frames — but on only 15 % of the damage was the body
+      locked in its own swing. The hits therefore arrive because the body
+      backs *along the enemy's facing*, which stays inside the box.
+
     Decision order (a small deterministic state machine):
 
     1. a committed swing is left alone (and never queued);
-    2. two enemies that can both land a hit within ``swing_land_s`` → disengage
-       (through a doorway when one is close enough to be worth it);
-    3. too close for a safe swing → back out to the band;
-    4. inside the standoff band with the swing volume covering the target and
-       our hit landing first → swing (the hit staggers the telegraph away);
-    5. a telegraph that lands before our swing can → step out of its reach;
+    2. any enemy whose box can connect inside ``dodge_window_s`` → **circle it**:
+       a perpendicular step that leaves the box while staying in punish range
+       (through a doorway when two or more can land at once);
+    3. the focus target is covered by the swing volume inside the standoff band
+       and **no enemy can reach the body during the 0.7 s swing lock** → swing;
+    4. the focus is clearly recovering and only a hit landing after ours can
+       answer → trade the swing for the stagger;
+    5. too close for a safe swing → back out to the band;
     6. inside the band but the swing would miss → one step to turn onto it;
     7. otherwise close on a BFS path.
     """
@@ -206,12 +300,6 @@ def _fight(
     screen = screen_delta(focus.rel_cells)
     distance_px = float(np.hypot(*screen)) * PX_PER_CELL
 
-    dangerous = [
-        slot
-        for slot in enemies
-        if slot.screen_distance_px <= slot.attack_reach_px + config.keepout_slack_px
-    ]
-    imminent = [slot for slot in dangerous if _threat_in_s(slot, config) <= config.swing_land_s]
     in_strike = distance_px <= player.attack_reach_px + config.strike_margin_px
     in_band = in_strike and distance_px >= _standoff_px(focus, config)
     # Exact swing-volume test (see ``_swing_covers``): the swing locks the
@@ -219,14 +307,77 @@ def _fight(
     # hitbox's live frames.
     covers = _swing_covers(player.facing, screen * PX_PER_CELL, player.attack_reach_px)
 
-    # 1. Two hits landing on us at once: no single swing can interrupt both.
-    if len(imminent) >= 2:
+    # Distance-aware threat timing for every perceived enemy: seconds until its
+    # box can touch the body *if it stands still from here* (round 4). The
+    # historic gate used ``_threat_in_s``, which ignores the closing time.
+    timings = {slot.slot: _time_to_hit(slot, config) for slot in enemies}
+    focus_threat = timings[focus.slot]
+    nearest_other = min(
+        (value for key, value in timings.items() if key != focus.slot),
+        default=_NO_THREAT_S,
+    )
+    dangerous = [
+        slot
+        for slot in enemies
+        if slot.screen_distance_px <= slot.attack_reach_px + config.keepout_slack_px
+    ]
+    imminent = [slot for slot in dangerous if timings[slot.slot] <= config.swing_land_s]
+
+    # 1. Swing gate. Round 3's geometry (standoff band + exact swing volume +
+    #    our hit landing first) plus round 4's *timing* rule: a landed hit
+    #    staggers, so the only cheap swing is one no other attacker can answer
+    #    inside the 0.7 s lock (``queue_gate``).
+    race_margin = config.swing_land_s + config.reaction_s
+    phase_ok = (
+        not config.punish_recover
+        or focus.state in ("recover", "stagger")
+        or (focus.state == "windup" and focus_threat >= race_margin)
+    )
+    # The gate is the *timing* model, not a distance proxy: an enemy 64 px away
+    # in a 0.1 s telegraph is inside its 72 px kill envelope (reach + the player's
+    # 22 px hurtbox) and lands before our 0.32 s hit, while a chasing enemy at the
+    # same distance still has to close first and loses the race.
+    if in_band and covers and phase_ok and focus_threat >= race_margin:
+        if not config.queue_gate and not config.pack_gate:
+            return _action(0, 1, 0)
+        if nearest_other >= config.swing_lock_s:
+            return _action(0, 1, 0)
+        if config.pack_gate and focus.state in ("recover", "stagger"):
+            if nearest_other > config.swing_land_s:
+                return _action(0, 1, 0)
+
+    # 2. Perpendicular dodge: an attacker whose box will connect inside
+    #    ``dodge_window_s`` is circled instead of backed away from. The volume is
+    #    an oriented box frozen with its facing, so a lateral step leaves it
+    #    while a retreat along the facing stays inside (measured: 87 % in-box on
+    #    the active frames with the old straight retreat).
+    incoming = [slot for slot in enemies if timings[slot.slot] <= config.dodge_window_s]
+    if config.strafe_dodge and incoming:
+        if len(incoming) >= 2 and config.doorway_retreat:
+            doorway = _doorway_step(layout, grid, incoming, previous, config.doorway_max_cells)
+            if doorway is not None:
+                return _action(doorway, 0, 0)
+        step = _strafe_step(layout, grid, incoming, previous, config)
+        if step is not None:
+            return _action(step, 0, 0)
+
+    # 3. Queue gate blocked the swing: open the distance so the attackers line up
+    #    behind the leader instead of standing in the middle of the pack.
+    if config.queue_gate and nearest_other < config.swing_lock_s:
+        packed = [slot for slot in enemies if slot.screen_distance_px <= config.separate_px]
+        if len(packed) >= 2:
+            if config.chokepoint:
+                doorway = _doorway_step(
+                    layout, grid, packed, previous, config.doorway_max_cells, any_door=True
+                )
+                if doorway is not None:
+                    return _action(doorway, 0, 0)
+            return _retreat(layout, grid, packed, previous, config)
+
+    # 4. Two hits landing on us at once: no single swing can interrupt both.
+    if len(imminent) >= 2 and not config.strafe_dodge:
         return _retreat(layout, grid, imminent, previous, config)
 
-    # 2. Timing. Our swing lands ``swing_land_s`` after the start and the hit
-    #    staggers whatever it touches out of its telegraph, so the focus target
-    #    may be attacked as soon as our hit lands first.
-    focus_threat = _threat_in_s(focus, config)
     if not in_band and in_strike:
         # Point blank: back out to the band before trading (a 0.7 s lock from
         # inside 0.9 x the enemy's reach cannot be escaped, see the docstring).
@@ -234,8 +385,6 @@ def _fight(
         # two attackers the nearest one alternates and a single-threat flee
         # ping-pongs between them.
         return _retreat(layout, grid, dangerous or [focus], previous, config)
-    if in_band and covers and (focus not in dangerous or focus_threat >= config.swing_land_s):
-        return _action(0, 1, 0)
     if focus in dangerous and focus_threat < config.swing_land_s:
         return _retreat(layout, grid, [focus], previous, config)
 
@@ -288,15 +437,25 @@ def _doorway_step(
     grid: np.ndarray,
     threats: Sequence[EnemySlot],
     previous: int,
+    max_cells: float = 99.0,
+    *,
+    any_door: bool = False,
 ) -> int | None:
-    """First BFS step to a doorway that is farther from the pack than we are."""
+    """First BFS step to a doorway that is farther from the pack than we are.
+
+    ``max_cells`` bounds the walk (the round-4 chokepoint rule: fight from a
+    doorway only when one is close, otherwise the retreat path itself costs more
+    than the hits it saves).
+    """
     centroid = _centroid_screen(threats)
     here = float(np.hypot(*centroid))
     paths = _bfs(layout, grid)
     doors = [
         (cell, path)
         for cell, path in paths.items()
-        if cell != (0, 0) and layout.cell(grid, cell[0], cell[1], "doorway") > 0.5
+        if cell != (0, 0)
+        and layout.cell(grid, cell[0], cell[1], "doorway") > 0.5
+        and _screen_length(cell) <= max_cells
     ]
     if not doors:
         return None
@@ -304,9 +463,131 @@ def _doorway_step(
         doors,
         key=lambda item: (item[1][1], item[0][0], item[0][1]),
     )
-    if float(np.hypot(*(screen_delta(cell) - centroid))) <= here:
+    if not any_door and float(np.hypot(*(screen_delta(cell) - centroid))) <= here:
+        # The doorway is on the pack's side of the body: retreating into it would
+        # walk *through* the attackers.
         return None
     return _no_reversal(path[0], previous, layout, grid)
+
+
+def _strafe_step(
+    layout: Layout,
+    grid: np.ndarray,
+    threats: Sequence[EnemySlot],
+    previous: int,
+    config: HeuristicConfig,
+) -> int | None:
+    """One step *perpendicular* to the nearest attacker's bearing.
+
+    The enemy attack volume is an oriented rectangle that starts at the enemy's
+    feet and extends ``attack_reach_px`` along its facing with the documented
+    body width (``44 * scale``). The facing freezes when the chase ends, so a
+    step along the facing (retreating) stays inside the volume while a step
+    perpendicular leaves it. Measured on level 1: the lateral margin at the
+    active frames has a median of 24 px, and the player covers that in 0.1 s at
+    259 px/s.
+
+    The score keeps the body in punish range (``strafe_band_px`` outside the
+    attacker's own reach) so the swing is available the moment the recovery
+    starts, and prefers to continue the previous direction so consecutive steps
+    circle the enemy instead of oscillating across its facing.
+    """
+    if not threats:
+        return None
+    threat = min(threats, key=lambda slot: (slot.screen_distance_px, slot.slot))
+    cells = np.asarray(screen_delta(threat.rel_cells), dtype=np.float64)
+    length = float(np.hypot(*cells))
+    if length <= 1e-6:
+        return None
+    # Unit perpendicular in screen space, on the configured side only: a fixed
+    # rotation direction makes consecutive steps circle the attacker instead of
+    # cancelling out (see ``strafe_side``).
+    perp = np.array([-cells[1] / length, cells[0] / length]) * float(config.strafe_side)
+    target_px = threat.attack_reach_px + config.strafe_band_px
+    others = [slot for slot in threats if slot.slot != threat.slot]
+    if config.strafe_side in (1, -1):
+        index, _score = _best_strafe_step(
+            layout,
+            grid,
+            cells,
+            perp,
+            target_px,
+            others,
+            previous,
+            config,
+            require_lateral=True,
+        )
+        return index
+    # ``strafe_side == 0`` (measured worse: 0/10): evaluate both sides and keep
+    # the best score, which flips as soon as the body crosses the bearing axis.
+    best: int | None = None
+    best_score = -np.inf
+    for side in (1.0, -1.0):
+        index, score = _best_strafe_step(
+            layout,
+            grid,
+            cells,
+            perp * side,
+            target_px,
+            others,
+            previous,
+            config,
+            require_lateral=True,
+        )
+        if index is not None and score > best_score + 1e-9:
+            best, best_score = index, score
+    return best
+
+
+def _best_strafe_step(
+    layout: Layout,
+    grid: np.ndarray,
+    cells: np.ndarray,
+    perp: np.ndarray,
+    target_px: float,
+    others: Sequence[EnemySlot],
+    previous: int,
+    config: HeuristicConfig,
+    *,
+    require_lateral: bool,
+) -> tuple[int | None, float]:
+    """Best single step along ``perp`` (one side), or ``(None, -inf)``."""
+    best_index: int | None = None
+    best_score = -np.inf
+    for spec in layout.actions:
+        if not spec.moving:
+            continue
+        if not _step_is_free(layout, grid, spec.grid):
+            continue
+        step_cells = np.asarray(screen_delta(spec.grid), dtype=np.float64)
+        lateral = float(step_cells[0] * perp[0] + step_cells[1] * perp[1]) * PX_PER_CELL
+        if require_lateral and lateral <= 0.0:
+            # This side has no lateral step at all: try the other side.
+            continue
+        after = cells - step_cells
+        after_px = float(np.hypot(*after)) * PX_PER_CELL
+        score = lateral - config.strafe_drift_weight * abs(after_px - target_px)
+        # Avoid stepping into another attacker's volume.
+        for other in others:
+            gap = float(np.hypot(*(step_cells - np.asarray(screen_delta(other.rel_cells)))))
+            if gap * PX_PER_CELL <= other.attack_reach_px + config.keepout_slack_px:
+                score -= 40.0
+        if (
+            previous
+            and spec.index == previous
+            and after_px >= target_px - config.strafe_hold_floor_px
+        ):
+            # Continue the current sidestep, but never to keep closing in: the
+            # unconditional bonus re-selected a forward-lateral step that walked
+            # the body from 35 px to 21 px on seed 8 (measured in the trace), and
+            # point blank is the one place where the box cannot be escaped.
+            score += config.strafe_hold_bonus
+        if score > best_score + 1e-9:
+            best_score = score
+            best_index = int(spec.index)
+    if require_lateral and best_index is None:
+        return None, -np.inf
+    return best_index, best_score
 
 
 def _standoff_px(enemy: EnemySlot, config: HeuristicConfig) -> float:
@@ -320,34 +601,86 @@ def _standoff_px(enemy: EnemySlot, config: HeuristicConfig) -> float:
 
 
 def _focus_target(enemies: Sequence[EnemySlot], config: HeuristicConfig) -> EnemySlot:
-    """The enemy to kill next: the nearest wounded one, else the nearest.
+    """The enemy to kill next.
 
     Focus fire finishes a target instead of spreading damage over the pack
-    (three wounded enemies hit exactly as hard as three healthy ones). Wounded
-    means "already below full HP" and only among enemies that are close enough
-    to be worth walking to; the nearest living enemy is the fallback.
+    (three wounded enemies hit exactly as hard as three healthy ones). With
+    ``isolate_target`` the choice is the **most isolated** wounded enemy — the
+    one whose nearest pack-mate is farthest — because the 0.7 s swing lock costs
+    a hit for every attacker inside reach, and a lone skeleton can be killed
+    without taking any. Without it, the historic rule stays: the nearest wounded
+    enemy, else the nearest.
     """
     reachable = [slot for slot in enemies if slot.screen_distance_px <= config.pack_radius_px * 4.0]
     pool = reachable or list(enemies)
+    if config.isolate_target:
+
+        def isolation(slot: EnemySlot) -> float:
+            mates = [other.screen_distance_px for other in enemies if other.slot != slot.slot]
+            return min(mates) if mates else _NO_THREAT_S
+
+        wounded = [slot for slot in pool if slot.hp_frac < 0.999]
+        return min(
+            wounded or pool,
+            key=lambda slot: (-isolation(slot), slot.screen_distance_px, slot.slot),
+        )
     wounded = [slot for slot in pool if slot.hp_frac < 0.999]
     return min(wounded or pool, key=lambda slot: (slot.screen_distance_px, slot.slot))
 
 
-def _threat_in_s(enemy: EnemySlot, config: HeuristicConfig) -> float:
-    """Seconds until this enemy's swing can damage the player (lower = sooner).
+#: ``(attack_windup, attack_active, attack_recover)`` per enemy type, read from
+#: ``resources/enemies/*.tres``. The observation publishes the windup *remaining*
+#: and the state progress but not the state lengths, so the pack timing model
+#: needs the table: "time until this body can hit me" is what decides whether a
+#: committed swing is safe.
+ENEMY_TIMING: dict[str, tuple[float, float, float]] = {
+    "slime_green": (0.35, 0.15, 0.40),
+    "slime_red": (0.35, 0.15, 0.40),
+    "slime_black": (0.45, 0.15, 0.45),
+    "skeleton_normal": (0.35, 0.30, 0.40),
+    "skeleton_armored": (0.55, 0.36, 0.55),
+    "skeleton_swift": (0.20, 0.70, 0.35),
+    "elite_skeleton": (0.50, 0.40, 0.50),
+    "elite_slime": (0.45, 0.20, 0.45),
+    "demonlord": (0.60, 0.25, 0.80),
+}
 
-    A chasing enemy has to reach its trigger range and wind up first, so it is
-    never an *immediate* threat; a telegraph is one ``windup_remaining`` away;
-    an active swing is live now; a recovering or staggered enemy cannot answer
-    at all this window.
+
+def _enemy_timing(type_name: str) -> tuple[float, float, float]:
+    """The ``(windup, active, recover)`` seconds of a type (defaults: skeleton)."""
+    return ENEMY_TIMING.get(type_name, ENEMY_TIMING["skeleton_normal"])
+
+
+def _time_to_hit(enemy: EnemySlot, config: HeuristicConfig) -> float:
+    """Seconds until this enemy's box can connect if the body stands still.
+
+    The round-4 pack model. A live swing is now; a telegraph is its remaining
+    windup; a recovery still owes its remaining state plus the next windup; a
+    chasing enemy first has to close the gap at its *published* move speed. The
+    old ``_threat_in_s`` ignored the closing time, which is why a policy holding
+    a standoff band still started swings while a second attacker was 90 px away
+    and one window short of the lock.
     """
     if enemy.hitbox_active or enemy.state == "attack":
         return 0.0
+    windup, _active, recover = _enemy_timing(enemy.type_name)
     if enemy.state == "windup":
-        return max(enemy.windup_remaining_s, 0.0)
-    if enemy.state in ("recover", "stagger", "dead"):
+        if enemy.windup_remaining_s > 0.0:
+            return enemy.windup_remaining_s
+        # A probe/observation without the remaining time: derive it from the
+        # state progress instead of assuming a fresh telegraph.
+        return windup * (1.0 - enemy.state_progress)
+    if enemy.state == "stagger":
         return _NO_THREAT_S
-    return max(config.assumed_windup_s, enemy.attack_cooldown_s)
+    if enemy.state == "recover":
+        remaining = max(1.0 - enemy.state_progress, 0.0) * recover
+        return remaining + windup + max(enemy.attack_cooldown_s, 0.0)
+    if enemy.state == "dead":
+        return _NO_THREAT_S
+    # Idle / chase / other: the body is outside the volume, it has to close in.
+    gap = max(enemy.screen_distance_px - enemy.attack_reach_px, 0.0)
+    speed = max(enemy.move_speed_px, 1.0)
+    return gap / speed + windup + max(enemy.attack_cooldown_s, 0.0)
 
 
 def _enter_portal(
