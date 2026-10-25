@@ -1,0 +1,294 @@
+{
+  "action_directions": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      1.0,
+      0.0
+    ],
+    [
+      0.893999993801117,
+      0.446999996900558
+    ],
+    [
+      0.0,
+      1.0
+    ],
+    [
+      -0.893999993801117,
+      0.446999996900558
+    ],
+    [
+      -1.0,
+      0.0
+    ],
+    [
+      -0.893999993801117,
+      -0.446999996900558
+    ],
+    [
+      0.0,
+      -1.0
+    ],
+    [
+      0.893999993801117,
+      -0.446999996900558
+    ]
+  ],
+  "action_schema": "ashcrown-act-v1",
+  "blocks": [
+    {
+      "fields": [
+        "level",
+        "tick",
+        "game_seconds",
+        "mode_level",
+        "mode_run",
+        "mode_combat",
+        "wave_index",
+        "wave_active",
+        "level_cleared",
+        "enemies_spawned",
+        "enemies_alive",
+        "kills",
+        "gold",
+        "gem_red",
+        "gem_blue",
+        "gem_green",
+        "gem_white",
+        "boss_hp",
+        "boss_phase",
+        "boss_aoe_timer",
+        "portal_active",
+        "portal_rel_x",
+        "portal_rel_y",
+        "portal_distance",
+        "merchant_present",
+        "merchant_rel_x",
+        "merchant_rel_y",
+        "merchant_distance",
+        "nearest_enemy_distance",
+        "nearest_enemy_bearing_sin",
+        "nearest_enemy_bearing_cos"
+      ],
+      "name": "global",
+      "offset": 0,
+      "size": 31
+    },
+    {
+      "fields": [
+        "alive",
+        "hp_frac",
+        "hp_abs",
+        "max_hp",
+        "armor",
+        "damage",
+        "move_speed",
+        "attack_speed_mult",
+        "cell_x",
+        "cell_y",
+        "facing_sin",
+        "facing_cos",
+        "state_idle",
+        "state_walk",
+        "state_attack",
+        "state_dead",
+        "attack_progress",
+        "attack_hitbox_active",
+        "attack_queued",
+        "knocked_back",
+        "attack_reach",
+        "attack_speed_bonus",
+        "velocity_x",
+        "velocity_y"
+      ],
+      "name": "player",
+      "offset": 31,
+      "size": 24
+    },
+    {
+      "fields": [
+        "present",
+        "type_slime_green",
+        "type_slime_red",
+        "type_slime_black",
+        "type_skeleton_normal",
+        "type_skeleton_armored",
+        "type_skeleton_swift",
+        "type_elite_skeleton",
+        "type_elite_slime",
+        "type_demonlord",
+        "rel_x",
+        "rel_y",
+        "distance",
+        "bearing_sin",
+        "bearing_cos",
+        "hp_frac",
+        "armor",
+        "move_speed",
+        "damage",
+        "state_idle",
+        "state_chase",
+        "state_windup",
+        "state_attack",
+        "state_recover",
+        "state_stagger",
+        "state_dead",
+        "state_other",
+        "state_progress",
+        "windup_remaining",
+        "attack_hitbox_active",
+        "attack_cooldown",
+        "facing_sin",
+        "facing_cos",
+        "is_elite",
+        "is_boss",
+        "asleep",
+        "knocked_back",
+        "attack_reach",
+        "scale"
+      ],
+      "name": "enemies",
+      "offset": 55,
+      "shape": [
+        12,
+        39
+      ],
+      "size": 468
+    },
+    {
+      "fields": [
+        "present",
+        "kind_gold",
+        "kind_gem_red",
+        "kind_gem_blue",
+        "kind_gem_green",
+        "kind_gem_white",
+        "rel_x",
+        "rel_y",
+        "distance"
+      ],
+      "name": "pickups",
+      "offset": 523,
+      "shape": [
+        4,
+        9
+      ],
+      "size": 36
+    },
+    {
+      "fields": [
+        "present",
+        "rel_x",
+        "rel_y",
+        "radius",
+        "remaining",
+        "kind"
+      ],
+      "name": "hazards",
+      "offset": 559,
+      "shape": [
+        4,
+        6
+      ],
+      "size": 24
+    },
+    {
+      "fields": [
+        "present",
+        "rel_x",
+        "rel_y",
+        "distance",
+        "within_interact_range"
+      ],
+      "name": "merchant",
+      "offset": 583,
+      "size": 5
+    },
+    {
+      "fields": [
+        "damage_dealt",
+        "damage_taken",
+        "kills",
+        "gold_gained",
+        "gems_gained",
+        "attacks_started",
+        "hits_landed",
+        "player_healed",
+        "level_cleared",
+        "died",
+        "portal_entered",
+        "merchant_bought"
+      ],
+      "name": "events",
+      "offset": 588,
+      "size": 12
+    },
+    {
+      "channels": [
+        "floor",
+        "wall",
+        "solid_prop",
+        "doorway",
+        "hazard",
+        "visited"
+      ],
+      "name": "grid",
+      "offset": 600,
+      "shape": [
+        6,
+        21,
+        21
+      ],
+      "size": 2646
+    }
+  ],
+  "enemy_states": [
+    "idle",
+    "chase",
+    "windup",
+    "attack",
+    "recover",
+    "stagger",
+    "dead",
+    "other"
+  ],
+  "enemy_types": [
+    "slime_green",
+    "slime_red",
+    "slime_black",
+    "skeleton_normal",
+    "skeleton_armored",
+    "skeleton_swift",
+    "elite_skeleton",
+    "elite_slime",
+    "demonlord"
+  ],
+  "grid": {
+    "channel_names": [
+      "floor",
+      "wall",
+      "solid_prop",
+      "doorway",
+      "hazard",
+      "visited"
+    ],
+    "channels": 6,
+    "radius": 10,
+    "size": 21
+  },
+  "obs_len": 3246,
+  "obs_schema": "ashcrown-obs-v1",
+  "perception_radius": 900.0,
+  "pickup_kinds": [
+    "gold",
+    "gem_red",
+    "gem_blue",
+    "gem_green",
+    "gem_white"
+  ],
+  "protocol": 1,
+  "rel_cell_scale": 32.0
+}

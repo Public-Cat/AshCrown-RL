@@ -276,9 +276,7 @@ def test_verify_handshake_uses_the_compat_layout_hash_pin() -> None:
     with pytest.raises(ProtocolMismatch, match="layout_hash"):
         verify_handshake(_hello(), compat={"layout_hash": "c" * 64})
     # The explicit argument overrides the pin (evaluation of an older build).
-    verify_handshake(
-        _hello(), compat={"layout_hash": "c" * 64}, expected_layout_hash="a" * 64
-    )
+    verify_handshake(_hello(), compat={"layout_hash": "c" * 64}, expected_layout_hash="a" * 64)
 
 
 def test_verify_handshake_requires_the_documented_clamp() -> None:

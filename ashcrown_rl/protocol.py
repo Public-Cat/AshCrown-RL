@@ -306,9 +306,7 @@ def verify_handshake(
         contract_hash = contract.get("layout_hash")
         pinned_hash = contract_hash if isinstance(contract_hash, str) else None
     if pinned_hash is not None and layout_hash != pinned_hash:
-        raise ProtocolMismatch(
-            f"handshake layout_hash={layout_hash} but {pinned_hash} is required"
-        )
+        raise ProtocolMismatch(f"handshake layout_hash={layout_hash} but {pinned_hash} is required")
     clamp = _verify_clamp(hello.get("obs_clamp"))
     if "obs_clamp" in contract and list(contract["obs_clamp"]) != list(clamp):
         raise ProtocolMismatch(
