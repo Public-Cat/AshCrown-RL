@@ -393,6 +393,16 @@ uv run ruff check . && uv run ruff format --check .
 `test_replay.py`); they skip cleanly when the game checkout or the godot binary
 is missing.
 
+The **`train` extra is optional and never required to collect the suite**. The
+Stable-Baselines3 pipeline (`ashcrown_rl/sb3_train.py`, re-exported lazily by
+`ashcrown_rl.train`) is exercised by `test_train_ppo.py` and `test_dagger.py`,
+which skip as whole modules when `stable-baselines3`/`torch` are absent — the
+documented dev-only gate (`uv sync --locked --extra dev && uv run pytest`) stays
+green and reports them as *skipped*, never as collection errors.
+`tests/test_scaffold.py` pins that split: a subprocess with a meta-path finder
+that hides the train extra must import every core module, and every SB3 name
+must stay unresolved until it is used (INT-97).
+
 ## Troubleshooting
 
 **`GodotUnavailable: no game checkout found` / `no godot binary`** — set
